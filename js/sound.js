@@ -98,13 +98,51 @@ export function playIncome() {
   noise(c, t + 0.15, { dur: 0.5, peak: 0.05, freq: 7000, q: 0.8, type: 'highpass' }); // parıltı
 }
 
-/** Para çıkışı: hızlı "vıııt" süzülmesi + alçalan kısa ton. */
-export function playExpense() {
+// Harcama sesi seçenekleri (Ayarlar → Harcama sesi).
+export const EXPENSE_STYLES = [
+  ['soft', 'Yumuşak'],
+  ['coin', 'Bozuk para'],
+  ['pop', 'Damla'],
+];
+
+export function getExpenseStyle() {
+  try {
+    const v = localStorage.getItem('expenseSound');
+    return EXPENSE_STYLES.some(([k]) => k === v) ? v : 'soft';
+  } catch { return 'soft'; }
+}
+export function setExpenseStyle(v) {
+  try { localStorage.setItem('expenseSound', v); } catch { /* yok */ }
+}
+
+const EXPENSE = {
+  // İki notalı, alçalan yumuşak marimba: "tın-tın"
+  soft(c, t) {
+    for (const [f, dt] of [[784, 0], [587.3, 0.11]]) {
+      osc(c, t + dt, { freq: f, peak: 0.34, attack: 0.006, decay: 0.32 });
+      osc(c, t + dt, { freq: f * 4, peak: 0.05, attack: 0.003, decay: 0.08 });
+      osc(c, t + dt, { freq: f * 2, peak: 0.07, attack: 0.004, decay: 0.15 });
+    }
+  },
+  // Masaya düşen bozuk para: sekmeler giderek sıklaşır ve kısılır.
+  coin(c, t) {
+    const hits = [[0, 0.34], [0.13, 0.22], [0.22, 0.15], [0.28, 0.1], [0.32, 0.06]];
+    for (const [dt, g] of hits) {
+      bell(c, t + dt, 2350, g);
+      noise(c, t + dt, { dur: 0.02, peak: g * 0.6, freq: 6000, q: 3 });
+    }
+  },
+  // Tek, yuvarlak "blup"
+  pop(c, t) {
+    osc(c, t, { freq: 520, toFreq: 210, peak: 0.42, attack: 0.008, decay: 0.2 });
+    osc(c, t, { freq: 1040, toFreq: 420, peak: 0.06, attack: 0.008, decay: 0.12 });
+  },
+};
+
+/** Para çıkışı: seçili harcama sesi. */
+export function playExpense(style = getExpenseStyle()) {
   if (!isEnabled()) return;
   const c = getCtx();
   if (!c) return;
-  const t = c.currentTime + 0.02;
-  noise(c, t, { dur: 0.28, peak: 0.4, freq: 2600, toFreq: 350, q: 1.4 });
-  osc(c, t + 0.02, { freq: 740, toFreq: 300, type: 'triangle', peak: 0.28, attack: 0.01, decay: 0.22 });
-  osc(c, t + 0.02, { freq: 370, toFreq: 150, type: 'sine', peak: 0.18, attack: 0.01, decay: 0.25 });
+  (EXPENSE[style] || EXPENSE.soft)(c, c.currentTime + 0.02);
 }
