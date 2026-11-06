@@ -3,7 +3,7 @@ import * as cr from './crypto.js';
 import { formatTL, formatPlain, parseAmount, todayISO, isValidISODate, formatDateLabel, formatDateTime, formatMonth, shiftMonth, esc } from './format.js';
 import * as sound from './sound.js';
 
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const LOCK_AFTER_MS = 60 * 1000;
 const BACKUP_REMIND_DAYS = 14;
 
@@ -14,7 +14,7 @@ const DEFAULT_CATEGORIES = {
 
 /*
  * VERİ MODELİ (tutarlar kuruş cinsinden tam sayı)
- *  account:     { id, name, initialBalance, order, createdAt, updatedAt }
+ *  account:     { id, name, initialBalance, includeInTotal (yoksa true), order, createdAt, updatedAt }
  *  category:    { id, type: 'income'|'expense', name, order, createdAt }
  *  transaction: { id, type: 'income'|'expense'|'transfer', amount (>0), date: 'YYYY-MM-DD',
  *                 accountId, toAccountId (yalnız transfer), categoryId (transferde null),
@@ -55,6 +55,11 @@ const accountById = id => S.data.accounts.find(a => a.id === id);
 const categoryById = id => S.data.categories.find(c => c.id === id);
 const txnById = id => S.data.transactions.find(t => t.id === id);
 const accName = id => accountById(id)?.name ?? 'Silinmiş hesap';
+/** Hesap toplam bakiyeye ve Hareketler'e dahil mi? (alan yoksa: evet) */
+const isCounted = id => accountById(id)?.includeInTotal !== false;
+/** Hareketler/aylık özet için: dahil olmayan hesabın işlemleri gizlenir.
+ *  Transfer, uçlarından biri dahil hesapsa görünür (toplamı değiştirdiği için). */
+const isVisibleTxn = t => (t.type === 'transfer' ? isCounted(t.accountId) || isCounted(t.toAccountId) : isCounted(t.accountId));
 const catName = id => categoryById(id)?.name ?? 'Kategorisiz';
 const sortTxns = list => list.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.createdAt - a.createdAt));
 
@@ -162,7 +167,7 @@ function go(view, accountId = null) {
 function viewMain() {
   const bal = computeBalances();
   const accs = sortedAccounts();
-  const total = accs.reduce((s, a) => s + (bal.get(a.id) || 0), 0);
+  const total = accs.filter(a => isCounted(a.id)).reduce((s, a) => s + (bal.get(a.id) || 0), 0);
   const hasData = S.data.transactions.length > 0 || accs.length > 0;
   const days = S.meta.lastBackupAt ? (Date.now() - S.meta.lastBackupAt) / 864e5 : Infinity;
   const banner = hasData && days > BACKUP_REMIND_DAYS
@@ -171,9 +176,10 @@ function viewMain() {
 
   const cards = accs.map(a => {
     const b = bal.get(a.id) || 0;
-    return `<div class="card" data-action="open-account" data-id="${a.id}">
+    const counted = isCounted(a.id);
+    return `<div class="card ${counted ? '' : 'excluded'}" data-action="open-account" data-id="${a.id}">
       <div class="card-info">
-        <div class="card-name">${esc(a.name)}</div>
+        <div class="card-name">${esc(a.name)}${counted ? '' : '<span class="tag">Toplama dahil değil</span>'}</div>
         <div class="card-bal num ${signClass(b)}">${formatTL(b)}</div>
       </div>
       <div class="card-btns">
@@ -266,7 +272,7 @@ function viewAccount() {
     </header>
     <section class="acc-head">
       <div class="amount num ${signClass(bal)}">${formatTL(bal)}</div>
-      <div class="sub">Başlangıç: ${formatTL(a.initialBalance)} · ${txns.length} işlem</div>
+      <div class="sub">Başlangıç: ${formatTL(a.initialBalance)} · ${txns.length} işlem${isCounted(a.id) ? '' : ' · Toplama dahil değil'}</div>
       <div class="acc-actions">
         <div class="act"><button class="round-btn minus" data-action="add-expense" data-id="${a.id}" aria-label="Gider">−</button>Gider</div>
         <div class="act"><button class="round-btn xfer" data-action="transfer" data-id="${a.id}" aria-label="Transfer">${I.xfer}</button>Transfer</div>
@@ -280,7 +286,7 @@ function viewAccount() {
 function monthTotals(ym) {
   let income = 0, expense = 0;
   for (const t of S.data.transactions) {
-    if (!t.date.startsWith(ym)) continue;
+    if (!t.date.startsWith(ym) || !isVisibleTxn(t)) continue;
     if (t.type === 'income') income += t.amount;
     else if (t.type === 'expense') expense += t.amount;
   }
@@ -326,7 +332,7 @@ function activityRow(t) {
 
 function viewActivity() {
   const ym = S.month;
-  const inMonth = S.data.transactions.filter(t => t.date.startsWith(ym));
+  const inMonth = S.data.transactions.filter(t => t.date.startsWith(ym) && isVisibleTxn(t));
   const { income, expense } = monthTotals(ym);
   const net = income - expense;
   const shown = sortTxns(inMonth.filter(t => S.filter === 'all' || t.type === S.filter));
@@ -376,7 +382,7 @@ function viewSettings() {
   const accs = sortedAccounts();
   const accRows = accs.map((a, i) => `
     <div class="set-row">
-      <div class="grow">${esc(a.name)}</div>
+      <div class="grow">${esc(a.name)}${isCounted(a.id) ? '' : '<span class="tag">Dahil değil</span>'}</div>
       <button class="icon-btn" data-action="move-account" data-id="${a.id}" data-dir="-1" ${i === 0 ? 'disabled' : ''} aria-label="Yukarı taşı">${I.up}</button>
       <button class="icon-btn" data-action="move-account" data-id="${a.id}" data-dir="1" ${i === accs.length - 1 ? 'disabled' : ''} aria-label="Aşağı taşı">${I.down}</button>
       <button class="icon-btn" data-action="edit-account" data-id="${a.id}" aria-label="Düzenle">${I.edit}</button>
@@ -586,6 +592,16 @@ function openAccountSheet(acc = null) {
       </div>
       <input type="hidden" name="sign" value="${neg ? '-1' : '1'}">
       <div class="section-note">Kredi kartı borcu gibi eksi bakiye için işareti − yap.${acc ? ' Başlangıç bakiyesini değiştirmek güncel bakiyeyi aynı miktarda değiştirir.' : ''}</div>
+      <label class="switch-row">
+        <span class="switch-text">
+          <span>Toplam bakiyeye dahil</span>
+          <span class="switch-note">Kapalıysa toplam paraya ve Hareketler'e yansımaz; işlemleri yalnızca hesaba dokununca görünür.</span>
+        </span>
+        <span class="switch">
+          <input type="checkbox" name="include" ${acc?.includeInTotal === false ? '' : 'checked'}>
+          <span class="slider"></span>
+        </span>
+      </label>
       <div class="form-error"></div>
       <div class="form-actions">
         <button class="btn btn-primary btn-block" type="submit">Kaydet</button>
@@ -681,9 +697,10 @@ async function submitAccount(form) {
   const now = Date.now();
   const old = form.dataset.id ? accountById(form.dataset.id) : null;
   const maxOrder = S.data.accounts.reduce((m, a) => Math.max(m, a.order), -1);
+  const includeInTotal = !!form.elements.include?.checked;
   const acc = old
-    ? { ...old, name, initialBalance: amount, updatedAt: now }
-    : { id: cr.uuid(), name, initialBalance: amount, order: maxOrder + 1, createdAt: now, updatedAt: now };
+    ? { ...old, name, initialBalance: amount, includeInTotal, updatedAt: now }
+    : { id: cr.uuid(), name, initialBalance: amount, includeInTotal, order: maxOrder + 1, createdAt: now, updatedAt: now };
   await commit({ accounts: [acc] });
   closeSheet();
   render();
@@ -821,7 +838,7 @@ function validateBackup(obj) {
   const now = Date.now();
 
   const accounts = (obj.accounts || []).map((a, i) => {
-    const r = { id: str(a.id, 64), name: str(a.name, 40).trim(), initialBalance: int(a.initialBalance), order: Number.isFinite(a.order) ? a.order : i, createdAt: a.createdAt || now, updatedAt: a.updatedAt || now };
+    const r = { id: str(a.id, 64), name: str(a.name, 40).trim(), initialBalance: int(a.initialBalance), includeInTotal: a.includeInTotal !== false, order: Number.isFinite(a.order) ? a.order : i, createdAt: a.createdAt || now, updatedAt: a.updatedAt || now };
     if (!r.id || !r.name || Number.isNaN(r.initialBalance)) throw new Error(`Hatalı hesap kaydı (#${i + 1}).`);
     return r;
   });
