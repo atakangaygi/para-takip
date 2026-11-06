@@ -161,6 +161,35 @@ button { cursor: pointer; border: 0; background: none; padding: 0; }
 }
 .row:last-child { border-bottom: 0; }
 button.row:active { background: var(--surface-2); }
+
+/* Kaydırarak silme */
+.swipe {
+  position: relative; overflow: hidden;
+  border-bottom: 1px solid var(--border);
+  user-select: none; -webkit-user-select: none;
+  max-height: 120px;
+  transition: max-height .18s ease, opacity .18s ease;
+}
+.swipe:last-child { border-bottom: 0; }
+.swipe .row {
+  position: relative; z-index: 1;
+  border-bottom: 0;
+  background: var(--surface);
+  touch-action: pan-y;
+  transition: transform .22s cubic-bezier(.2, .8, .2, 1);
+  will-change: transform;
+}
+.swipe.dragging .row { transition: none; }
+.swipe-del {
+  position: absolute; top: 0; right: 0; bottom: 0;
+  width: 84px;
+  background: var(--red); color: #fff;
+  display: flex; align-items: center; justify-content: flex-end;
+  padding-right: 30px;
+}
+.swipe-del svg { width: 24px; height: 24px; transition: transform .15s; }
+.swipe.full .swipe-del svg { transform: scale(1.25); }
+.swipe.removing { max-height: 0; opacity: 0; }
 .row-icon {
   width: 36px; height: 36px; border-radius: 10px; flex: none;
   display: flex; align-items: center; justify-content: center;
@@ -484,3 +513,7 @@ body.privacy-on .privacy { display: flex; }
 .field-row { display: flex; gap: 10px; }
 .field-row > .field { flex: 1; min-width: 0; }
 .field-row > .field-date { flex: 0 0 148px; }
+
+.toast { display: flex; align-items: center; gap: 14px; }
+.toast.has-action { pointer-events: auto; }
+.toast-btn { color: var(--accent); font-weight: 700; font-size: 14px; padding: 4px 2px; white-space: nowrap; }

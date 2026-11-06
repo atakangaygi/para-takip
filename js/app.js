@@ -3,7 +3,7 @@ import * as cr from './crypto.js';
 import { formatTL, formatPlain, parseAmount, todayISO, isValidISODate, formatDateLabel, formatDateTime, formatMonth, shiftMonth, esc } from './format.js';
 import * as sound from './sound.js';
 
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const LOCK_AFTER_MS = 60 * 1000;
 const BACKUP_REMIND_DAYS = 14;
 
@@ -74,12 +74,19 @@ function computeBalances() {
 const signClass = v => (v < 0 ? 'neg' : '');
 
 let toastTimer;
-function toast(msg, ms = 2600) {
+let toastAction = null;
+function toast(msg, ms = 2600, action = null) {
   const el = $('#toast');
-  el.textContent = msg;
+  el.innerHTML = `<span>${esc(msg)}</span>${action ? `<button class="toast-btn">${esc(action.label)}</button>` : ''}`;
+  el.classList.toggle('has-action', !!action);
+  toastAction = action;
   el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), ms);
+  toastTimer = setTimeout(hideToast, ms);
+}
+function hideToast() {
+  $('#toast').classList.remove('show', 'has-action');
+  toastAction = null;
 }
 
 function haptic() { try { navigator.vibrate?.(10); } catch { /* yok */ } }
@@ -135,6 +142,7 @@ function defaultCategories() {
 // ---------------------------------------------------------------- render
 function render() {
   if (!S.dek) return;
+  openSwipe = null;
   const app = $('#app');
   if (S.view === 'account' && !accountById(S.accountId)) S.view = 'main';
   if (S.view === 'main') app.innerHTML = viewMain();
@@ -220,11 +228,19 @@ function txnRow(t, perspectiveId) {
     amtCls = inc ? 'pos' : 'neg';
   }
   sub = t.note ? esc(t.note) : '';
-  return `<button class="row" data-action="edit-txn" data-id="${t.id}">
+  return swipeWrap(t.id, `<button class="row" data-action="edit-txn" data-id="${t.id}">
     <div class="row-icon ${cls}">${icon}</div>
     <div class="row-main"><div class="row-title">${title}</div>${sub ? `<div class="row-sub">${sub}</div>` : ''}</div>
     <div class="row-amt num ${amtCls}">${amt}</div>
-  </button>`;
+  </button>`);
+}
+
+/** Sağdan sola kaydırınca arkadaki kırmızı ✕ (hızlı sil) görünür. */
+function swipeWrap(id, rowHtml) {
+  return `<div class="swipe" data-id="${id}">
+    <button class="swipe-del" data-action="swipe-delete" data-id="${id}" aria-label="İşlemi sil" tabindex="-1">${I.close}</button>
+    ${rowHtml}
+  </div>`;
 }
 
 function viewAccount() {
@@ -298,14 +314,14 @@ function activityRow(t) {
     from = accName(t.accountId); to = accName(t.toAccountId);
     amt = formatTL(t.amount); amtCls = 'muted';
   }
-  return `<button class="row" data-action="edit-txn" data-id="${t.id}">
+  return swipeWrap(t.id, `<button class="row" data-action="edit-txn" data-id="${t.id}">
     <div class="row-icon ${cls}">${icon}</div>
     <div class="row-main">
       <div class="row-title flow"><span>${esc(from)}</span><span class="arrow">→</span><span>${esc(to)}</span></div>
       ${t.note ? `<div class="row-sub">${esc(t.note)}</div>` : ''}
     </div>
     <div class="row-amt num ${amtCls}">${amt}</div>
-  </button>`;
+  </button>`);
 }
 
 function viewActivity() {
@@ -406,10 +422,11 @@ function viewSettings() {
     <div class="section-title">Güvenlik</div>
     <div class="list">
       <button class="set-btn" data-action="toggle-sound">Sesler <span class="val">${sound.isEnabled() ? 'Açık' : 'Kapalı'}</span></button>
+      ${sound.isEnabled() ? `<button class="set-btn" data-action="cycle-expense-sound">Harcama sesi <span class="val">${sound.EXPENSE_STYLES.find(([k]) => k === sound.getExpenseStyle())[1]} ›</span></button>` : ''}
       <button class="set-btn" data-action="change-pin">PIN değiştir</button>
       <button class="set-btn" data-action="lock">Şimdi kilitle</button>
     </div>
-    <div class="section-note">Sesler iPhone sessiz moddayken duyulmaz. Uygulama her açılışta ve 1 dakikadan uzun arka planda kalınca PIN sorar. Veriler PBKDF2 (${cr.PBKDF2_ITERATIONS.toLocaleString('tr-TR')} tur) + AES-256-GCM ile şifrelenir.</div>
+    <div class="section-note">Harcama sesine dokundukça seçenekler arasında geçer ve çalar. Sesler iPhone sessiz moddayken duyulmaz. Uygulama her açılışta ve 1 dakikadan uzun arka planda kalınca PIN sorar. Veriler PBKDF2 (${cr.PBKDF2_ITERATIONS.toLocaleString('tr-TR')} tur) + AES-256-GCM ile şifrelenir.</div>
 
     <div class="section-title">Uygulama</div>
     <div class="list">
@@ -709,6 +726,20 @@ async function deleteTxn(id) {
   closeSheet();
   render();
   toast('İşlem silindi');
+}
+
+/** Kaydırarak silme: onay sormadan siler, birkaç saniye "Geri al" sunar. */
+async function quickDeleteTxn(id) {
+  const t = txnById(id);
+  if (!t) return;
+  const row = document.querySelector(`.swipe[data-id="${id}"]`);
+  if (row) { row.classList.add('removing'); await new Promise(r => setTimeout(r, 180)); }
+  await commit({}, { transactions: [id] });
+  render();
+  toast('İşlem silindi', 5000, {
+    label: 'Geri al',
+    run: async () => { await commit({ transactions: [t] }); render(); toast('Geri alındı'); },
+  });
 }
 
 async function deleteAccount(id) {
@@ -1160,6 +1191,15 @@ function bindEvents() {
         break;
       }
       case 'delete-txn': run(() => deleteTxn(id)); break;
+      case 'swipe-delete': run(() => quickDeleteTxn(id)); break;
+      case 'cycle-expense-sound': {
+        const list = sound.EXPENSE_STYLES.map(([k]) => k);
+        const next = list[(list.indexOf(sound.getExpenseStyle()) + 1) % list.length];
+        sound.setExpenseStyle(next);
+        sound.playExpense(next);
+        render();
+        break;
+      }
       case 'del-category': run(() => deleteCategory(id)); break;
       case 'close-sheet': closeSheet(); break;
       case 'toggle-sign': {
@@ -1202,6 +1242,15 @@ function bindEvents() {
 
   $('#sheet-backdrop').addEventListener('click', closeSheet);
 
+  $('#toast').addEventListener('click', e => {
+    if (!e.target.closest('.toast-btn') || !toastAction) return;
+    const a = toastAction;
+    hideToast();
+    Promise.resolve(a.run()).catch(err => { console.error(err); toast('Hata: ' + (err.message || err)); });
+  });
+
+  bindSwipe();
+
   // Arka plan kilidi: 1 dakikadan uzun arka planda kalınca kilitle.
   let hiddenAt = 0;
   document.addEventListener('visibilitychange', () => {
@@ -1230,6 +1279,93 @@ function bindEvents() {
     vv.addEventListener('resize', upd);
     vv.addEventListener('scroll', upd);
   }
+}
+
+// ---------------------------------------------------------------- kaydırarak silme
+const SWIPE_W = 84;      // açıkken görünen ✕ alanı genişliği
+let openSwipe = null;    // açık duran satır (.swipe)
+
+function setSwipeX(sw, x) {
+  sw.querySelector('.row').style.transform = x ? `translateX(${x}px)` : '';
+  sw.querySelector('.swipe-del').style.width = `${Math.max(SWIPE_W, -x)}px`;
+}
+function closeSwipe(sw = openSwipe) {
+  if (!sw) return;
+  sw.classList.remove('open');
+  setSwipeX(sw, 0);
+  if (openSwipe === sw) openSwipe = null;
+}
+
+function bindSwipe() {
+  let drag = null;           // { sw, x0, y0, base, dx, active }
+  let suppressClick = false;
+
+  document.addEventListener('pointerdown', e => {
+    suppressClick = false;
+    const sw = e.target.closest('.swipe');
+    const onDel = !!e.target.closest('.swipe-del');
+    if (openSwipe && openSwipe !== sw) { closeSwipe(); suppressClick = true; }
+    if (!sw || onDel || (e.pointerType === 'mouse' && e.button !== 0)) return;
+    const wasOpen = sw === openSwipe;
+    drag = { sw, x0: e.clientX, y0: e.clientY, base: wasOpen ? -SWIPE_W : 0, dx: 0, active: false, closeOnTap: wasOpen };
+  });
+
+  document.addEventListener('pointermove', e => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x0;
+    const dy = e.clientY - drag.y0;
+    if (!drag.active) {
+      if (Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx)) { drag = null; return; } // dikey kaydırma
+      if (Math.abs(dx) < 8) return;
+      drag.active = true;
+      drag.sw.classList.add('dragging');
+    }
+    let x = drag.base + dx;
+    if (x > 0) x = x / 4;                       // sağa doğru direnç
+    const w = drag.sw.offsetWidth;
+    if (x < -w * 0.85) x = -w * 0.85;
+    drag.dx = x;
+    drag.sw.classList.toggle('full', x < -w * 0.55);
+    setSwipeX(drag.sw, x);
+  });
+
+  const end = () => {
+    if (!drag) return;
+    const { sw, active, dx, closeOnTap } = drag;
+    drag = null;
+    if (!active) {
+      if (closeOnTap) { closeSwipe(sw); suppressClick = true; } // açık satıra dokunmak onu kapatır
+      return;
+    }
+    suppressClick = true;
+    sw.classList.remove('dragging');
+    const full = sw.classList.contains('full');
+    sw.classList.remove('full');
+    if (full) { haptic(); quickDeleteTxn(sw.dataset.id).catch(err => toast('Hata: ' + err.message)); return; }
+    if (dx < -SWIPE_W / 2) {
+      if (openSwipe && openSwipe !== sw) closeSwipe();
+      sw.classList.add('open');
+      setSwipeX(sw, -SWIPE_W);
+      openSwipe = sw;
+    } else closeSwipe(sw);
+  };
+  document.addEventListener('pointerup', end);
+  document.addEventListener('pointercancel', () => {
+    if (drag?.active) { drag.sw.classList.remove('dragging', 'full'); closeSwipe(drag.sw); }
+    drag = null;
+  });
+
+  // Kaydırma veya açık satırı kapatma hareketinden sonra gelen "click" düzenleme panelini açmasın.
+  document.addEventListener('click', e => {
+    if (!suppressClick) return;
+    suppressClick = false;
+    if (e.target.closest('.swipe-del')) return;
+    e.stopPropagation();
+    e.preventDefault();
+  }, true);
+
+  // Görünüm yeniden çizilince açık satır referansı geçersizleşir.
+  window.addEventListener('scroll', () => closeSwipe(), { passive: true });
 }
 
 // ---------------------------------------------------------------- açılış
