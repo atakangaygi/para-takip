@@ -24,7 +24,7 @@
   <!-- PIN / kilit ekranı -->
   <div id="lock" class="lock">
     <div class="lock-inner">
-      <div class="lock-logo" aria-hidden="true">₺</div>
+      <div class="lock-logo" id="lock-logo" aria-hidden="true">₺</div>
 
       <div id="lock-intro" class="lock-intro hidden">
         <h1>Para Takip</h1>
@@ -42,15 +42,12 @@
         <div id="lock-dots" class="dots" aria-hidden="true"></div>
         <p id="lock-msg" class="lock-msg" role="alert"></p>
         <div id="keypad" class="keypad">
-          <button data-key="1">1</button><button data-key="2">2</button><button data-key="3">3</button>
-          <button data-key="4">4</button><button data-key="5">5</button><button data-key="6">6</button>
-          <button data-key="7">7</button><button data-key="8">8</button><button data-key="9">9</button>
-          <button data-key="back" class="key-fn" aria-label="Sil">⌫</button>
-          <button data-key="0">0</button>
-          <button data-key="ok" class="key-fn key-ok" aria-label="Tamam">✓</button>
+          <button data-key="1"><span class="kd">1</span><span class="kl">&nbsp;</span></button><button data-key="2"><span class="kd">2</span><span class="kl">ABC</span></button><button data-key="3"><span class="kd">3</span><span class="kl">DEF</span></button>
+          <button data-key="4"><span class="kd">4</span><span class="kl">GHI</span></button><button data-key="5"><span class="kd">5</span><span class="kl">JKL</span></button><button data-key="6"><span class="kd">6</span><span class="kl">MNO</span></button>
+          <button data-key="7"><span class="kd">7</span><span class="kl">PQRS</span></button><button data-key="8"><span class="kd">8</span><span class="kl">TUV</span></button><button data-key="9"><span class="kd">9</span><span class="kl">WXYZ</span></button>
+          <button data-key="ok" id="key-ok" class="key-text">Tamam</button><button data-key="0"><span class="kd">0</span><span class="kl">&nbsp;</span></button><button data-key="back" id="key-back" class="key-text">Sil</button>
         </div>
         <div class="lock-foot">
-          <button id="lock-cancel" class="link hidden" data-lock="cancel">Vazgeç</button>
           <button id="lock-forgot" class="link hidden" data-lock="forgot">PIN'imi unuttum</button>
         </div>
       </div>

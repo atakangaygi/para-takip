@@ -389,40 +389,87 @@ input[type="date"]::-webkit-date-and-time-value { text-align: left; }
   font-size: 14px;
   margin: 18px 0 22px;
 }
-.dots { display: flex; justify-content: center; gap: 14px; height: 16px; }
-.dot { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--muted); transition: background .1s, border-color .1s; }
-.dot.on { background: var(--text); border-color: var(--text); }
+.dots { display: flex; justify-content: center; gap: 24px; height: 16px; }
+.dot { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--text); transition: background .1s; }
+.dot.on { background: var(--text); }
 .dots.shake { animation: shake .4s; }
 @keyframes shake {
   0%, 100% { transform: translateX(0); }
-  20%, 60% { transform: translateX(-10px); }
-  40%, 80% { transform: translateX(10px); }
+  20%, 60% { transform: translateX(-12px); }
+  40%, 80% { transform: translateX(12px); }
 }
-.lock-msg { color: var(--red); font-size: 14px; min-height: 20px; margin: 14px 0 10px; }
+.lock-msg { color: var(--red); font-size: 15px; min-height: 22px; margin: 18px 0 22px; }
 .lock-msg.info { color: var(--muted); }
+
+/* iPhone kilit ekranı tarzı tuş takımı */
 .keypad {
-  display: grid; grid-template-columns: repeat(3, 76px);
-  justify-content: center; gap: 14px 22px;
+  --key: min(82px, 22vw);
+  display: grid; grid-template-columns: repeat(3, var(--key));
+  justify-content: center; column-gap: min(28px, 7vw); row-gap: 16px;
 }
 .keypad button {
-  width: 76px; height: 76px; border-radius: 50%;
-  background: var(--surface-2);
-  font-size: 30px; font-weight: 400;
+  width: var(--key); height: var(--key); border-radius: 50%;
+  background: rgba(255, 255, 255, .13);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
   user-select: none; -webkit-user-select: none;
+  transition: background .25s;
 }
-.keypad button:active { background: var(--surface-3); }
-.keypad .key-fn { background: transparent; font-size: 24px; color: var(--muted); }
-.keypad .key-ok { color: var(--accent); font-size: 28px; }
+.keypad button:active { background: rgba(255, 255, 255, .45); transition: none; }
+.keypad .kd { font-size: 38px; font-weight: 400; line-height: 1; letter-spacing: 0; }
+.keypad .kl { font-size: 10px; font-weight: 700; letter-spacing: .2em; margin-top: 3px; margin-right: -.2em; line-height: 1; min-height: 10px; }
+.keypad .key-text { background: transparent; font-size: 17px; font-weight: 400; color: var(--text); }
+.keypad .key-text:active { background: transparent; opacity: .4; }
+.keypad .invisible { visibility: hidden; }
 .keypad.busy { opacity: .4; pointer-events: none; }
-.lock-foot { display: flex; justify-content: center; gap: 24px; margin-top: 18px; min-height: 44px; }
+.lock-foot { display: flex; justify-content: center; gap: 24px; margin-top: 14px; min-height: 44px; }
 .link { color: var(--accent); font-size: 15px; padding: 10px; }
+.lock .lock-logo { width: 52px; height: 52px; font-size: 28px; border-radius: 14px; margin-bottom: 14px; }
+.lock-pin h1 { font-size: 21px; font-weight: 500; margin-bottom: 4px; }
+.lock-pin .lock-sub { margin-bottom: 26px; }
 
-@media (max-height: 640px) {
-  .keypad { grid-template-columns: repeat(3, 64px); gap: 10px 20px; }
-  .keypad button { width: 64px; height: 64px; font-size: 26px; }
-  .lock-logo { width: 48px; height: 48px; font-size: 26px; margin-bottom: 10px; }
-  .lock-sub { margin-bottom: 14px; }
+@media (max-height: 700px) {
+  .keypad { --key: 72px; row-gap: 12px; }
+  .keypad .kd { font-size: 32px; }
+  .lock .lock-logo { display: none; }
+  .lock-pin .lock-sub { margin-bottom: 18px; }
+  .lock-msg { margin: 12px 0 14px; }
 }
+
+/* ---------- Hareketler ---------- */
+.month-pill {
+  display: inline-flex; align-items: center; gap: 10px;
+  margin-top: 14px; padding: 8px 10px 8px 14px;
+  border-radius: 999px; background: var(--surface);
+  font-size: 14px; font-weight: 600;
+}
+.month-pill:active { background: var(--surface-2); }
+.month-pill .muted { font-weight: 500; }
+.month-pill .chev { display: inline-flex; color: var(--muted); }
+.month-pill .chev svg { width: 16px; height: 16px; }
+
+.month-nav { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
+.month-nav .icon-btn:disabled { opacity: .25; }
+.month-label { font-size: 20px; font-weight: 700; }
+.summary {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+  background: var(--surface); border-radius: var(--radius);
+  padding: 14px; margin-top: 8px; text-align: center;
+}
+.s-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.s-val { font-size: 15px; font-weight: 700; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.filters { display: flex; gap: 8px; margin-top: 14px; overflow-x: auto; scrollbar-width: none; }
+.filters::-webkit-scrollbar { display: none; }
+.filter-chip { padding: 8px 14px; border-radius: 999px; background: var(--surface); font-size: 14px; color: var(--muted); white-space: nowrap; }
+.filter-chip.on { background: var(--text); color: var(--bg); font-weight: 600; }
+.day-head {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+  font-size: 13px; color: var(--muted); font-weight: 600;
+  padding: 18px 4px 8px;
+}
+.day-sum { display: flex; gap: 10px; white-space: nowrap; }
+.row-title.flow { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.row-title.flow span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-title.flow .arrow { flex: none; color: var(--muted); }
 
 /* Uygulama değiştiricide bakiyeleri gizle */
 .privacy {

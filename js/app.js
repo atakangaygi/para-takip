@@ -1,8 +1,9 @@
 import * as db from './db.js';
 import * as cr from './crypto.js';
-import { formatTL, formatPlain, parseAmount, todayISO, isValidISODate, formatDateLabel, formatDateTime, esc } from './format.js';
+import { formatTL, formatPlain, parseAmount, todayISO, isValidISODate, formatDateLabel, formatDateTime, formatMonth, shiftMonth, esc } from './format.js';
+import * as sound from './sound.js';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const LOCK_AFTER_MS = 60 * 1000;
 const BACKUP_REMIND_DAYS = 14;
 
@@ -28,6 +29,8 @@ const S = {
   data: { accounts: [], categories: [], transactions: [], recurring: [] },
   view: 'main',
   accountId: null,
+  month: todayISO().slice(0, 7), // Hareketler ekranındaki ay (YYYY-MM)
+  filter: 'all',                 // all | income | expense | transfer
   meta: { pinLength: 4, lastBackupAt: null },
 };
 
@@ -40,6 +43,8 @@ const I = {
   up: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>',
   down: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>',
   close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+  list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg>',
+  next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>',
   lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
 };
 
@@ -135,9 +140,11 @@ function render() {
   if (S.view === 'main') app.innerHTML = viewMain();
   else if (S.view === 'account') app.innerHTML = viewAccount();
   else if (S.view === 'settings') app.innerHTML = viewSettings();
+  else if (S.view === 'activity') app.innerHTML = viewActivity();
 }
 
 function go(view, accountId = null) {
+  if (view === 'activity' && S.view !== 'activity') { S.month = todayISO().slice(0, 7); S.filter = 'all'; }
   S.view = view;
   S.accountId = accountId;
   render();
@@ -170,7 +177,10 @@ function viewMain() {
 
   return `
     <header class="topbar">
-      <div class="side"><button class="icon-btn" data-action="lock" aria-label="Kilitle">${I.lock}</button></div>
+      <div class="side">
+        <button class="icon-btn" data-action="lock" aria-label="Kilitle">${I.lock}</button>
+        <button class="icon-btn" data-action="activity" aria-label="Hareketler">${I.list}</button>
+      </div>
       <h1></h1>
       <div class="side right">
         <button class="icon-btn" data-action="transfer" aria-label="Transfer">${I.xfer}</button>
@@ -180,6 +190,7 @@ function viewMain() {
     <section class="total">
       <div class="label">Toplam Para</div>
       <div class="amount num ${signClass(total)}">${formatTL(total)}</div>
+      ${monthPill()}
     </section>
     ${banner}
     ${accs.length
@@ -250,6 +261,101 @@ function viewAccount() {
   `;
 }
 
+function monthTotals(ym) {
+  let income = 0, expense = 0;
+  for (const t of S.data.transactions) {
+    if (!t.date.startsWith(ym)) continue;
+    if (t.type === 'income') income += t.amount;
+    else if (t.type === 'expense') expense += t.amount;
+  }
+  return { income, expense };
+}
+
+function monthPill() {
+  const ym = todayISO().slice(0, 7);
+  const { income, expense } = monthTotals(ym);
+  return `<button class="month-pill" data-action="activity">
+    <span class="muted">Bu ay</span>
+    <span class="pos num">+${formatTL(income)}</span>
+    <span class="neg num">−${formatTL(expense)}</span>
+    <span class="chev">${I.next}</span>
+  </button>`;
+}
+
+/** Hareketler satırı: nereden → nereye */
+function activityRow(t) {
+  let icon, cls, from, to, amt, amtCls;
+  if (t.type === 'income') {
+    cls = 'income'; icon = '+';
+    from = catName(t.categoryId); to = accName(t.accountId);
+    amt = '+' + formatTL(t.amount); amtCls = 'pos';
+  } else if (t.type === 'expense') {
+    cls = 'expense'; icon = '−';
+    from = accName(t.accountId); to = catName(t.categoryId);
+    amt = '−' + formatTL(t.amount); amtCls = 'neg';
+  } else {
+    cls = 'transfer'; icon = I.xfer;
+    from = accName(t.accountId); to = accName(t.toAccountId);
+    amt = formatTL(t.amount); amtCls = 'muted';
+  }
+  return `<button class="row" data-action="edit-txn" data-id="${t.id}">
+    <div class="row-icon ${cls}">${icon}</div>
+    <div class="row-main">
+      <div class="row-title flow"><span>${esc(from)}</span><span class="arrow">→</span><span>${esc(to)}</span></div>
+      ${t.note ? `<div class="row-sub">${esc(t.note)}</div>` : ''}
+    </div>
+    <div class="row-amt num ${amtCls}">${amt}</div>
+  </button>`;
+}
+
+function viewActivity() {
+  const ym = S.month;
+  const inMonth = S.data.transactions.filter(t => t.date.startsWith(ym));
+  const { income, expense } = monthTotals(ym);
+  const net = income - expense;
+  const shown = sortTxns(inMonth.filter(t => S.filter === 'all' || t.type === S.filter));
+
+  // Günlere göre grupla; gün başlığında o günün toplam girişi / çıkışı (transferler hariç).
+  let list = '';
+  for (let i = 0; i < shown.length;) {
+    const date = shown[i].date;
+    const rows = [];
+    let dIn = 0, dOut = 0;
+    while (i < shown.length && shown[i].date === date) {
+      const t = shown[i++];
+      if (t.type === 'income') dIn += t.amount;
+      else if (t.type === 'expense') dOut += t.amount;
+      rows.push(activityRow(t));
+    }
+    list += `<div class="day-head"><span>${formatDateLabel(date)}</span><span class="day-sum num">
+      ${dIn ? `<span class="pos">+${formatTL(dIn)}</span>` : ''}${dOut ? `<span class="neg">−${formatTL(dOut)}</span>` : ''}</span></div>
+      <div class="list">${rows.join('')}</div>`;
+  }
+
+  const chip = (key, label) => `<button class="filter-chip ${S.filter === key ? 'on' : ''}" data-action="filter" data-f="${key}">${label}</button>`;
+  const isCurrent = ym >= todayISO().slice(0, 7);
+
+  return `
+    <header class="topbar">
+      <div class="side"><button class="icon-btn" data-action="home" aria-label="Geri">${I.back}</button></div>
+      <h1>Hareketler</h1>
+      <div class="side right"></div>
+    </header>
+    <div class="month-nav">
+      <button class="icon-btn" data-action="month" data-d="-1" aria-label="Önceki ay">${I.back}</button>
+      <div class="month-label">${formatMonth(ym)}</div>
+      <button class="icon-btn" data-action="month" data-d="1" aria-label="Sonraki ay" ${isCurrent ? 'disabled' : ''}>${I.next}</button>
+    </div>
+    <div class="summary">
+      <div><div class="s-label">Gelen</div><div class="s-val pos num">+${formatTL(income)}</div></div>
+      <div><div class="s-label">Giden</div><div class="s-val neg num">−${formatTL(expense)}</div></div>
+      <div><div class="s-label">Net</div><div class="s-val num ${net < 0 ? 'neg' : net > 0 ? 'pos' : ''}">${net > 0 ? '+' : ''}${formatTL(net)}</div></div>
+    </div>
+    <div class="filters">${chip('all', 'Tümü')}${chip('income', 'Gelen')}${chip('expense', 'Giden')}${chip('transfer', 'Transfer')}</div>
+    ${shown.length ? list : `<div class="empty"><p>${inMonth.length ? 'Bu filtrede işlem yok.' : `${formatMonth(ym)} için işlem yok.`}</p></div>`}
+  `;
+}
+
 function viewSettings() {
   const accs = sortedAccounts();
   const accRows = accs.map((a, i) => `
@@ -299,10 +405,11 @@ function viewSettings() {
 
     <div class="section-title">Güvenlik</div>
     <div class="list">
+      <button class="set-btn" data-action="toggle-sound">Sesler <span class="val">${sound.isEnabled() ? 'Açık' : 'Kapalı'}</span></button>
       <button class="set-btn" data-action="change-pin">PIN değiştir</button>
       <button class="set-btn" data-action="lock">Şimdi kilitle</button>
     </div>
-    <div class="section-note">Uygulama her açılışta ve 1 dakikadan uzun arka planda kalınca PIN sorar. Veriler PBKDF2 (${cr.PBKDF2_ITERATIONS.toLocaleString('tr-TR')} tur) + AES-256-GCM ile şifrelenir.</div>
+    <div class="section-note">Sesler iPhone sessiz moddayken duyulmaz. Uygulama her açılışta ve 1 dakikadan uzun arka planda kalınca PIN sorar. Veriler PBKDF2 (${cr.PBKDF2_ITERATIONS.toLocaleString('tr-TR')} tur) + AES-256-GCM ile şifrelenir.</div>
 
     <div class="section-title">Uygulama</div>
     <div class="list">
@@ -514,6 +621,7 @@ async function submitTxn(form) {
     ? { ...old, amount, accountId, categoryId, note, date, updatedAt: now }
     : { id: cr.uuid(), type, amount, accountId, toAccountId: null, categoryId, note, date, recurringId: null, createdAt: now, updatedAt: now };
   await commit({ transactions: [txn] });
+  if (!old) (type === 'income' ? sound.playIncome : sound.playExpense)();
   rememberCategory(type, categoryId);
   haptic();
   closeSheet();
@@ -776,13 +884,12 @@ function showLock(mode, msg = '') {
   const T = {
     setup1: ['PIN belirle', '4–6 haneli bir PIN gir, ✓ ile onayla'],
     setup2: ['PIN\'i tekrar gir', 'Onaylamak için aynı PIN\'i gir'],
-    unlock: ['Para Takip', 'PIN\'ini gir'],
+    unlock: ['PIN\'i Gir', 'Para Takip'],
     'change-old': ['PIN değiştir', 'Mevcut PIN\'ini gir'],
     'change-new1': ['Yeni PIN', '4–6 haneli yeni PIN'],
     'change-new2': ['Yeni PIN\'i tekrar gir', 'Onaylamak için tekrar gir'],
   }[mode];
   if (T) { $('#lock-title').textContent = T[0]; $('#lock-sub').textContent = T[1]; }
-  $('#lock-cancel').classList.toggle('hidden', !mode?.startsWith('change'));
   $('#lock-forgot').classList.toggle('hidden', mode !== 'unlock');
   setLockMsg(msg);
   renderDots();
@@ -796,13 +903,27 @@ function hideLock() {
 }
 
 function expectedLen() {
-  return Lock.mode === 'unlock' || Lock.mode === 'change-old' ? S.meta.pinLength : null;
+  if (Lock.mode === 'unlock' || Lock.mode === 'change-old') return S.meta.pinLength;
+  if (Lock.mode === 'setup2' || Lock.mode === 'change-new2') return Lock.first.length || null;
+  return null;
+}
+
+/** iPhone kilit ekranı gibi: alt sıradaki metin tuşları duruma göre görünür. */
+function renderKeyLabels() {
+  const ok = $('#key-ok');
+  const back = $('#key-back');
+  const free = Lock.mode === 'setup1' || Lock.mode === 'change-new1';
+  ok.classList.toggle('invisible', !(free && Lock.buf.length >= 4 && Lock.buf.length < 6));
+  const canCancel = Lock.mode?.startsWith('change');
+  back.textContent = Lock.buf.length ? 'Sil' : 'Vazgeç';
+  back.classList.toggle('invisible', !Lock.buf.length && !canCancel);
 }
 
 function renderDots() {
   const exp = expectedLen();
   const n = exp ?? Math.min(6, Math.max(4, Lock.buf.length));
   $('#lock-dots').innerHTML = Array.from({ length: n }, (_, i) => `<span class="dot ${i < Lock.buf.length ? 'on' : ''}"></span>`).join('');
+  renderKeyLabels();
 }
 
 function setLockMsg(msg, info = false) {
@@ -845,7 +966,10 @@ function showLockoutCountdown(until) {
 
 function pinKey(k) {
   if (Lock.busy || !Lock.mode || Lock.mode === 'intro') return;
-  if (k === 'back') { Lock.buf = Lock.buf.slice(0, -1); renderDots(); return; }
+  if (k === 'back') {
+    if (!Lock.buf && Lock.mode.startsWith('change')) { hideLock(); return; }
+    Lock.buf = Lock.buf.slice(0, -1); renderDots(); return;
+  }
   if (k === 'ok') { pinSubmit(); return; }
   if (!/^\d$/.test(k) || Lock.buf.length >= 6) return;
   Lock.buf += k;
@@ -999,6 +1123,9 @@ function bindEvents() {
     else if (e.key === 'Escape' && Lock.mode.startsWith('change')) hideLock();
   });
 
+  // iOS: ses motoru ancak dokunuş sırasında açılabilir.
+  for (const ev of ['pointerdown', 'touchend', 'click']) document.addEventListener(ev, () => sound.unlock(), { capture: true, passive: true });
+
   // Uygulama + panel tıklamaları (event delegation)
   document.addEventListener('click', e => {
     if (!S.dek) return;
@@ -1010,6 +1137,15 @@ function bindEvents() {
       case 'open-account': go('account', id); break;
       case 'home': go('main'); break;
       case 'settings': go('settings'); break;
+      case 'activity': go('activity'); break;
+      case 'month': S.month = shiftMonth(S.month, Number(el.dataset.d)); render(); break;
+      case 'filter': S.filter = el.dataset.f; render(); break;
+      case 'toggle-sound': {
+        sound.setEnabled(!sound.isEnabled());
+        if (sound.isEnabled()) { sound.unlock(); sound.playIncome(); }
+        render();
+        break;
+      }
       case 'add-income': openTxnSheet('income', id); break;
       case 'add-expense': openTxnSheet('expense', id); break;
       case 'transfer': openTransferSheet(id); break;

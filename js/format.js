@@ -86,16 +86,17 @@ export function isValidISODate(s) {
   return dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d;
 }
 
-/** "2026-11-06" -> "Bugün" | "Dün" | "6 Kasım 2026, Cuma" */
+/** "2026-11-06" -> "Bugün · 6 Kasım" | "Dün · 5 Kasım" | "3 Kasım, Salı" */
 export function formatDateLabel(iso) {
   const today = new Date();
   const yest = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
-  if (iso === isoDate(today)) return 'Bugün';
-  if (iso === isoDate(yest)) return 'Dün';
   const [y, m, d] = iso.split('-').map(Number);
   const dt = new Date(y, m - 1, d);
   const yearPart = y === today.getFullYear() ? '' : ` ${y}`;
-  return `${d} ${MONTHS[m - 1]}${yearPart}, ${DAYS[dt.getDay()]}`;
+  const base = `${d} ${MONTHS[m - 1]}${yearPart}`;
+  if (iso === isoDate(today)) return `Bugün · ${base}`;
+  if (iso === isoDate(yest)) return `Dün · ${base}`;
+  return `${base}, ${DAYS[dt.getDay()]}`;
 }
 
 export function formatDateTime(ts) {
@@ -105,4 +106,17 @@ export function formatDateTime(ts) {
 
 export function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/** "2026-11" -> "Kasım 2026" */
+export function formatMonth(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  return `${MONTHS[m - 1]} ${y}`;
+}
+
+/** "2026-11" + (-1) -> "2026-10" */
+export function shiftMonth(ym, delta) {
+  const [y, m] = ym.split('-').map(Number);
+  const d = new Date(y, m - 1 + delta, 1);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
 }
