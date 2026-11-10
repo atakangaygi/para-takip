@@ -3,7 +3,7 @@ import * as cr from './crypto.js';
 import { formatTL, formatPlain, parseAmount, todayISO, isValidISODate, formatDateLabel, formatDateTime, formatMonth, shiftMonth, esc } from './format.js';
 import * as sound from './sound.js';
 
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 const LOCK_AFTER_MS = 60 * 1000;
 const BACKUP_REMIND_DAYS = 14;
 
@@ -174,12 +174,18 @@ function viewMain() {
     ? `<div class="banner"><span>${S.meta.lastBackupAt ? `Son yedek ${Math.floor(days)} gün önce.` : 'Henüz yedek almadın.'}</span><button data-action="export">Yedekle</button></div>`
     : '';
 
-  const cards = accs.map(a => {
+  // Ana ekran sırası: toplama dahil hesaplar bakiyeye göre çoktan aza (eşitse elle verilen sıra),
+  // dahil olmayanlar altta, Ayarlar'daki elle sırada.
+  const counted = accs.filter(a => isCounted(a.id))
+    .sort((a, b) => (bal.get(b.id) || 0) - (bal.get(a.id) || 0)); // Array.sort kararlı: eşitlikte elle sıra korunur
+  const excluded = accs.filter(a => !isCounted(a.id));
+
+  const card = a => {
     const b = bal.get(a.id) || 0;
     const counted = isCounted(a.id);
     return `<div class="card ${counted ? '' : 'excluded'}" data-action="open-account" data-id="${a.id}">
       <div class="card-info">
-        <div class="card-name">${esc(a.name)}${counted ? '' : '<span class="tag">Toplama dahil değil</span>'}</div>
+        <div class="card-name">${esc(a.name)}</div>
         <div class="card-bal num ${signClass(b)}">${formatTL(b)}</div>
       </div>
       <div class="card-btns">
@@ -187,7 +193,9 @@ function viewMain() {
         <button class="round-btn plus" data-action="add-income" data-id="${a.id}" aria-label="${esc(a.name)} gelir ekle">+</button>
       </div>
     </div>`;
-  }).join('');
+  };
+  const cards = counted.map(card).join('')
+    + (excluded.length ? `<div class="cards-sep">Toplama dahil olmayanlar</div>${excluded.map(card).join('')}` : '');
 
   return `
     <header class="topbar">

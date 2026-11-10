@@ -552,3 +552,8 @@ body.privacy-on .privacy { display: flex; }
 .switch input:checked + .slider { background: var(--green); }
 .switch input:checked + .slider::before { transform: translateX(20px); }
 .switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.cards-sep {
+  font-size: 13px; color: var(--muted); font-weight: 600;
+  padding: 14px 4px 0;
+}
