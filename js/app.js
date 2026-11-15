@@ -4,7 +4,7 @@ import { formatTL, formatPlain, parseAmount, todayISO, isValidISODate, formatDat
 import * as sound from './sound.js';
 import * as pay from './payments.js';
 
-const APP_VERSION = '1.5.1';
+const APP_VERSION = '1.6.0';
 const LOCK_AFTER_MS = 60 * 1000;
 const BACKUP_REMIND_DAYS = 14;
 
@@ -27,7 +27,9 @@ const DEFAULT_CATEGORIES = {
  *  payment:     { id, kind: 'loan'|'bill', name, dueDay, warnDays, firstPeriod, paid: { [period]: { at, amount, txnId } },
  *                 createdAt, updatedAt,
  *                 loan: amount (taksit, kuruş), remaining (kalan taksit; 0 = tamamlandı)
- *                 bill: amounts: { [period]: kuruş } (ödemeden önce girilen fatura tutarı) }
+ *                 bill: amounts: { [period]: kuruş } (ödemeden önce girilen fatura tutarı),
+ *                       items: [{ id, name, amount, repeat: true (her ay) | false (tek seferlik), period (tek seferlikte) }] }
+ *                 Faturada o döneme ait kalem varsa dönem tutarı kalemlerin toplamıdır; yoksa amounts[period].
  *  period = 'YYYY-MM'; son ödeme tarihi/uyarı hesapları payments.js'te.
  */
 
@@ -100,6 +102,15 @@ function dueLine(st) {
   return `Son ödeme: ${pay.formatDayMonth(st.dueDate)} · ${pay.dueText(st.days)}`;
 }
 
+/** Faturanın bir döneme ait kalemleri: her ay yinelenenler + o döneme özel tek seferlikler. */
+const billItems = (p, period) => (p.items || []).filter(it => it.repeat || it.period === period);
+/** Faturanın dönem tutarı: kalem varsa toplamı, yoksa elle girilen tutar (yoksa 0). */
+function billAmount(p, period) {
+  const items = billItems(p, period);
+  if (items.length) return items.reduce((s, it) => s + it.amount, 0);
+  return p.amounts?.[period] > 0 ? p.amounts[period] : 0;
+}
+
 /** Kartlar + krediler + faturalar tek listede; sıra: ödenmemişler (en yakın tarih), ödenmişler, tamamlanan krediler. */
 function dueEntries(bal, today = todayISO()) {
   const out = [];
@@ -122,8 +133,9 @@ function dueEntries(bal, today = todayISO()) {
       });
     } else {
       const st = pay.dueStatus(p, today);
-      const amt = p.amounts?.[st.period];
-      let info = amt > 0 ? formatTL(amt) : 'Tutar girilmedi';
+      const amt = billAmount(p, st.period);
+      const n = billItems(p, st.period).length;
+      let info = amt > 0 ? formatTL(amt) + (n ? ` · ${n} kalem` : '') : 'Tutar girilmedi';
       if (!(amt > 0) && st.level === 'paid' && st.lastPaid?.amount > 0) info = `Son ödenen ${formatTL(st.lastPaid.amount)}`;
       out.push({ kind: 'bill', id: p.id, name: p.name, st, done: false, amount: amt > 0 ? amt : null, info });
     }
@@ -249,37 +261,57 @@ function updateDots(i) {
   });
 }
 
-/** Render sonrası: sayfa konumunu animasyonsuz geri yükle, yüksekliği etkin sayfaya eşitle
- *  (kısa sayfada boş alan kalmasın), kaydırma bitince etkin sayfayı kaydet. */
+let pagerBusy = false; // parmak ekranda ya da kaydırma sürüyor
+
+/** Render sonrası: sayfa konumunu animasyonsuz geri yükle. Sayfalar en az ekran boyu kadar yüksek
+ *  (boş alandan da kaydırılabilsin). Kaydırıcı dururken etkin sayfanın yüksekliğine kırpılır;
+ *  kaydırma başlar başlamaz kırpma kalkar (gelen sayfanın altı boş/siyah görünmesin) ve
+ *  parmak kalkıp kaydırma durunca yeniden kırpılır. */
 function setupPager() {
   const pager = $('#pager');
   if (!pager) return;
+  pagerBusy = false;
   const pages = [...pager.children];
   if (S.mainPage >= pages.length) S.mainPage = 0;
+  const setMin = () => {
+    const top = pager.getBoundingClientRect().top + window.scrollY;
+    pager.style.setProperty('--page-min', `${Math.max(0, window.innerHeight - top - 24)}px`);
+  };
   const fit = () => {
     const p = pages[S.mainPage] || pages[0];
     pager.style.height = `${p.offsetHeight}px`;
   };
+  const open = () => { pager.style.height = `${Math.max(...pages.map(p => p.offsetHeight))}px`; };
+  setMin();
   pager.scrollLeft = S.mainPage * pager.clientWidth;
   fit();
   updateDots(S.mainPage);
   if (window.ResizeObserver) {
-    pagerRO = new ResizeObserver(() => { if (pager.isConnected) fit(); });
+    pagerRO = new ResizeObserver(() => { if (pager.isConnected && !pagerBusy) { setMin(); fit(); } });
     pages.forEach(p => pagerRO.observe(p));
   }
   let settle;
-  pager.addEventListener('scroll', () => {
+  let touching = false;
+  const finish = () => {
+    if (!pager.isConnected || touching) return;
     const w = pager.clientWidth || 1;
-    updateDots(Math.round(pager.scrollLeft / w));
-    clearTimeout(settle);
-    settle = setTimeout(() => {
-      if (!pager.isConnected) return;
-      const i = Math.max(0, Math.min(pages.length - 1, Math.round(pager.scrollLeft / w)));
-      if (i === S.mainPage) return;
-      S.mainPage = i;
-      fit();
-      if (window.scrollY > 0) window.scrollTo(0, 0);
-    }, 120);
+    const i = Math.max(0, Math.min(pages.length - 1, Math.round(pager.scrollLeft / w)));
+    if (Math.abs(pager.scrollLeft - i * w) > 2) { settle = setTimeout(finish, 120); return; } // yapışma sürüyor
+    pagerBusy = false;
+    const changed = i !== S.mainPage;
+    S.mainPage = i;
+    fit();
+    if (changed && window.scrollY > 0) window.scrollTo(0, 0);
+  };
+  const later = () => { clearTimeout(settle); settle = setTimeout(finish, 140); };
+  pager.addEventListener('touchstart', () => { touching = true; clearTimeout(settle); }, { passive: true });
+  const touchEnd = () => { touching = false; if (pagerBusy) later(); };
+  pager.addEventListener('touchend', touchEnd, { passive: true });
+  pager.addEventListener('touchcancel', touchEnd, { passive: true });
+  pager.addEventListener('scroll', () => {
+    if (!pagerBusy) { pagerBusy = true; open(); }
+    updateDots(Math.round(pager.scrollLeft / (pager.clientWidth || 1)));
+    later();
   }, { passive: true });
 }
 
@@ -847,17 +879,53 @@ function openPaymentSheet(kind, p = null) {
   const loan = kind === 'loan';
   const today = todayISO();
   const period = p ? pay.nextPeriod(p, today) : null;
+  const items = !loan && p ? billItems(p, period) : [];
   const billAmt = !loan && p && p.amounts?.[period] > 0 ? formatPlain(p.amounts[period]) : '';
   const history = !loan && p
     ? Object.entries(p.paid || {}).sort((a, b) => (a[0] < b[0] ? 1 : a[0] > b[0] ? -1 : 0)).slice(0, 24)
     : [];
   const title = p ? (loan ? 'Krediyi düzenle' : 'Faturayı düzenle') : (loan ? 'Kredi ekle' : 'Fatura ekle');
+
+  // Fatura kalemleri (yalnız kayıtlı faturada): ayrı form; ana formun düğmeleri form="pm-form" ile bağlanır.
+  const itemsBlock = !loan && p ? `
+    <form data-form="bill-item" data-id="${p.id}" data-period="${period}" novalidate>
+      <div class="field">
+        <span class="field-label">Kalemler · ${formatMonth(period)}</span>
+        ${items.length ? `<div class="hist">
+          ${items.map(it => `<div class="item-row">
+            <span class="item-name">${esc(it.name)}<span class="tag">${it.repeat ? 'Her ay' : 'Tek seferlik'}</span></span>
+            <span class="num">${formatTL(it.amount)}</span>
+            <button type="button" class="item-del" data-action="del-bill-item" data-id="${p.id}" data-item="${it.id}" aria-label="${esc(it.name)} kalemini sil">×</button>
+          </div>`).join('')}
+          <div class="item-row total"><span class="item-name">Toplam</span><span class="num">${formatTL(billAmount(p, period))}</span></div>
+        </div>` : '<div class="section-note flush">Faturanın içindekileri (tarife, abonelik, ek paket…) kalem olarak ekle; toplam kendiliğinden hesaplanır.</div>'}
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="i-name">Kalem adı</label>
+          <input id="i-name" name="name" class="input" maxlength="40" autocomplete="off" placeholder="ör. Tarife, Netflix" enterkeyhint="next">
+        </div>
+        <div class="field field-amt">
+          <label for="i-amount">Tutar</label>
+          <input id="i-amount" name="amount" class="input num" inputmode="decimal" autocomplete="off" placeholder="0,00" enterkeyhint="done">
+        </div>
+      </div>
+      <div class="item-add">
+        <div class="cat-pick choice">
+          <input type="radio" name="repeat" id="i-rep" value="1" checked><label for="i-rep">Her ay</label>
+          <input type="radio" name="repeat" id="i-once" value="0"><label for="i-once">Tek seferlik</label>
+        </div>
+        <button class="btn btn-small" type="submit">Ekle</button>
+      </div>
+      <div class="item-error"></div>
+    </form>` : '';
+
   const sheet = openSheet(`
     ${sheetHead(title)}
-    <form data-form="payment" data-kind="${kind}" ${p ? `data-id="${p.id}"` : ''} novalidate>
+    <form id="pm-form" data-form="payment" data-kind="${kind}" ${p ? `data-id="${p.id}"` : ''} novalidate>
       <div class="field">
         <label for="p-name">${loan ? 'Kredi adı' : 'Fatura adı'}</label>
-        <input id="p-name" name="name" class="input" maxlength="40" autocomplete="off" placeholder="${loan ? 'ör. İhtiyaç kredisi' : 'ör. Elektrik, Su, İnternet'}" value="${esc(p?.name ?? '')}" enterkeyhint="next">
+        <input id="p-name" name="name" class="input" maxlength="40" autocomplete="off" placeholder="${loan ? 'ör. İhtiyaç kredisi' : 'ör. Telefon, Elektrik, İnternet'}" value="${esc(p?.name ?? '')}" enterkeyhint="next">
       </div>
       <div class="field-row">
         <div class="field">
@@ -879,23 +947,68 @@ function openPaymentSheet(kind, p = null) {
           <label for="p-remaining">Kalan taksit</label>
           <input id="p-remaining" name="remaining" class="input num" inputmode="numeric" pattern="[0-9]*" maxlength="3" autocomplete="off" placeholder="ör. 18" value="${esc(p?.remaining ?? '')}" enterkeyhint="done">
         </div>
-      </div>` : `
+      </div>` : items.length ? '' : `
       <div class="field">
         <label for="p-amount">Bu dönemin tutarı (isteğe bağlı)${period ? ` · ${formatMonth(period)}` : ''}</label>
         <input id="p-amount" name="amount" class="input num" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${billAmt}" enterkeyhint="done">
       </div>`}
-      ${history.length ? `
-      <div class="field">
-        <span class="field-label">Geçmiş ödemeler</span>
-        <div class="hist">${history.map(([per, v]) => `<div class="hist-row"><span>${formatMonth(per)}</span><span class="num">${v.amount > 0 ? formatTL(v.amount) : 'İşaretlendi'}</span></div>`).join('')}</div>
-      </div>` : ''}
-      <div class="form-error"></div>
-      <div class="form-actions">
-        <button class="btn btn-primary btn-block" type="submit">Kaydet</button>
-        ${p ? `<button class="btn btn-danger btn-block" type="button" data-action="delete-payment" data-id="${p.id}">${loan ? 'Krediyi sil' : 'Faturayı sil'}</button>` : ''}
-      </div>
-    </form>`);
+    </form>
+    ${itemsBlock}
+    ${history.length ? `
+    <div class="field">
+      <span class="field-label">Geçmiş ödemeler</span>
+      <div class="hist">${history.map(([per, v]) => `<div class="hist-row"><span>${formatMonth(per)}</span><span class="num">${v.amount > 0 ? formatTL(v.amount) : 'İşaretlendi'}</span></div>`).join('')}</div>
+    </div>` : ''}
+    ${!loan && !p ? '<div class="section-note">Kaydettikten sonra faturaya kalem (her ay yinelenen ya da tek seferlik) ekleyebilirsin.</div>' : ''}
+    <div class="form-error"></div>
+    <div class="form-actions">
+      <button class="btn btn-primary btn-block" type="submit" form="pm-form">Kaydet</button>
+      ${p ? `<button class="btn btn-danger btn-block" type="button" data-action="delete-payment" data-id="${p.id}">${loan ? 'Krediyi sil' : 'Faturayı sil'}</button>` : ''}
+    </div>`);
   if (!p) $('#p-name', sheet).focus();
+}
+
+/** Faturaya kalem ekle (hemen kaydedilir), paneli aynı yerde yeniden çiz. */
+async function submitBillItem(form) {
+  const errEl = form.querySelector('.item-error');
+  const fail = msg => { errEl.textContent = msg; };
+  const p = paymentById(form.dataset.id);
+  const period = form.dataset.period;
+  if (!p || p.kind !== 'bill' || !isPeriod(period)) return fail('Fatura bulunamadı.');
+  const f = new FormData(form);
+  const name = String(f.get('name') || '').trim().slice(0, 40);
+  if (!name) return fail('Kalem adı gir.');
+  const amount = parseAmount(f.get('amount'));
+  if (!Number.isFinite(amount) || amount <= 0) return fail('Geçerli bir tutar gir.');
+  if ((p.items || []).length >= 100) return fail('Çok fazla kalem var.');
+  const repeat = f.get('repeat') !== '0';
+  const item = { id: cr.uuid(), name, amount, repeat };
+  if (!repeat) item.period = period;
+  const updated = { ...p, items: [...(p.items || []), item], updatedAt: Date.now() };
+  await commit({ payments: [updated] });
+  haptic();
+  reopenBillSheet(updated);
+  render();
+}
+
+async function deleteBillItem(id, itemId) {
+  const p = paymentById(id);
+  if (!p) return;
+  const updated = { ...p, items: (p.items || []).filter(it => it.id !== itemId), updatedAt: Date.now() };
+  await commit({ payments: [updated] });
+  reopenBillSheet(updated);
+  render();
+}
+
+/** Kalem eklenip silinince paneli kaydırma konumu ve yazılmış alanlar korunarak yeniden çizer. */
+function reopenBillSheet(p) {
+  const sheet = $('#sheet');
+  const top = sheet.scrollTop;
+  const keep = {};
+  for (const n of ['name', 'dueDay', 'warnDays']) keep[n] = $('#pm-form')?.elements[n]?.value;
+  openPaymentSheet('bill', p);
+  for (const [n, v] of Object.entries(keep)) { const el = $('#pm-form')?.elements[n]; if (el && v != null) el.value = v; }
+  sheet.scrollTop = top;
 }
 
 /** "Ödendi" paneli: her zaman sıradaki ödenmemiş dönem için. */
@@ -920,7 +1033,7 @@ function openPaySheet(kind, id) {
     if (debt > 0) full = formatPlain(debt);
     amount = full;
   } else if (kind === 'loan') amount = formatPlain(item.amount);
-  else if (item.amounts?.[period] > 0) amount = formatPlain(item.amounts[period]);
+  else if (billAmount(item, period) > 0) amount = formatPlain(billAmount(item, period));
 
   const sheet = openSheet(`
     ${sheetHead(`Ödendi: ${esc(item.name)}`)}
@@ -1109,7 +1222,8 @@ async function submitPayment(form) {
   } else {
     const amounts = { ...(old?.amounts || {}) };
     const period = pay.nextPeriod(p, today);
-    if (raw) {
+    if (!f.has('amount')) { /* kalemler varken tutar alanı gösterilmez */ }
+    else if (raw) {
       const amount = parseAmount(raw);
       if (!Number.isFinite(amount) || amount <= 0) return setFormError('Geçerli bir tutar gir ya da boş bırak.');
       amounts[period] = amount;
@@ -1121,6 +1235,7 @@ async function submitPayment(form) {
   closeSheet();
   render();
   toast(old ? 'Kaydedildi' : `${name} eklendi`);
+  if (!old && kind === 'bill') openPaymentSheet('bill', p); // kalem eklemek için hemen aç
 }
 
 async function deletePayment(id) {
@@ -1443,6 +1558,14 @@ function validateBackup(obj) {
         if (!isPeriod(k) || !(Number.isSafeInteger(v) && v > 0)) throw new Error(err);
         r.amounts[k] = v;
       }
+      if (p.items != null && !Array.isArray(p.items)) throw new Error(err);
+      r.items = (p.items || []).slice(0, 100).map(it => {
+        if (!isObj(it)) throw new Error(err);
+        const x = { id: str(it.id, 64), name: str(it.name, 40).trim(), amount: it.amount, repeat: it.repeat !== false };
+        if (!x.id || !x.name || !(Number.isSafeInteger(x.amount) && x.amount > 0)) throw new Error(err);
+        if (!x.repeat) { if (!isPeriod(it.period)) throw new Error(err); x.period = it.period; }
+        return x;
+      });
     }
     return r;
   });
@@ -1819,6 +1942,7 @@ function bindEvents() {
         break;
       }
       case 'delete-payment': run(() => deletePayment(id)); break;
+      case 'del-bill-item': run(() => deleteBillItem(id, el.dataset.item)); break;
       case 'pay': openPaySheet(el.dataset.kind, id); break;
       case 'mark-paid': run(() => markPaid(el.dataset.kind, id, el.dataset.period)); break;
       case 'close-sheet': closeSheet(); break;
@@ -1843,10 +1967,10 @@ function bindEvents() {
     if (!kind) return;
     e.preventDefault();
     if (!S.dek) return;
-    const btn = form.querySelector('[type="submit"]');
+    const btn = form.querySelector('[type="submit"]') || (form.id ? document.querySelector(`[type="submit"][form="${form.id}"]`) : null);
     if (btn?.disabled) return;
     if (btn) btn.disabled = true;
-    const fn = { txn: submitTxn, transfer: submitTransfer, account: submitAccount, 'add-category': addCategory, payment: submitPayment, pay: submitPay }[kind];
+    const fn = { txn: submitTxn, transfer: submitTransfer, account: submitAccount, 'add-category': addCategory, payment: submitPayment, pay: submitPay, 'bill-item': submitBillItem }[kind];
     Promise.resolve(fn?.(form))
       .catch(err => { console.error(err); setFormError('Kaydedilemedi: ' + (err.message || err)); })
       .finally(() => { if (btn) btn.disabled = false; });
@@ -1875,7 +1999,7 @@ function bindEvents() {
   // Döndürme / boyut değişince ana ekran sayfasını hizada tut.
   window.addEventListener('resize', () => {
     const pager = $('#pager');
-    if (pager) pager.scrollLeft = S.mainPage * pager.clientWidth;
+    if (pager && !pagerBusy) pager.scrollLeft = S.mainPage * pager.clientWidth;
   });
 
   $('#sheet-backdrop').addEventListener('click', closeSheet);

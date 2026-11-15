@@ -574,6 +574,7 @@ body.privacy-on .privacy { display: flex; }
 .page {
   flex: 0 0 100%; min-width: 0;
   scroll-snap-align: start; scroll-snap-stop: always;
+  min-height: var(--page-min, 0px); /* boş alandan da yana kaydırılabilsin */
   padding: 0 calc(16px + var(--sar)) 0 calc(16px + var(--sal));
 }
 .pager-dots {
@@ -678,3 +679,19 @@ body.privacy-on .privacy { display: flex; }
 }
 .hist-row:last-child { border-bottom: 0; }
 .hist-row .num { color: var(--muted); }
+
+/* ---------- Fatura kalemleri ---------- */
+.item-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 6px 6px 14px; min-height: 44px; font-size: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.item-row:last-child { border-bottom: 0; }
+.item-row .item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item-row.total { font-weight: 600; padding-right: 50px; }
+.item-del { width: 34px; height: 34px; flex: none; border-radius: 50%; color: var(--muted); font-size: 20px; line-height: 1; }
+.item-del:active { background: var(--surface-3); }
+.item-add { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; }
+.item-error { color: var(--red); font-size: 14px; min-height: 18px; margin-top: 8px; }
+.field-row > .field-amt { flex: 0 0 120px; }
+.section-note.flush { padding: 0 2px; }
