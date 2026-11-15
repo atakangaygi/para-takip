@@ -1,6 +1,6 @@
 // Uygulama kabuğunu önbelleğe alır; tamamen çevrimdışı çalışır.
 // Dosyalarda değişiklik yaptığında CACHE sürümünü artır, aksi halde eski dosyalar sunulur.
-const CACHE = 'para-takip-v1.5.0';
+const CACHE = 'para-takip-v1.5.1';
 const ASSETS = [
   './',
   './index.html',

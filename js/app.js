@@ -4,7 +4,7 @@ import { formatTL, formatPlain, parseAmount, todayISO, isValidISODate, formatDat
 import * as sound from './sound.js';
 import * as pay from './payments.js';
 
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '1.5.1';
 const LOCK_AFTER_MS = 60 * 1000;
 const BACKUP_REMIND_DAYS = 14;
 
@@ -602,7 +602,7 @@ function viewSettings() {
       </form>
     </div>`;
 
-  const lb = S.meta.lastBackupAt ? formatDateTime(S.meta.lastBackupAt) : 'Hiç';
+  const lb = S.meta.lastBackupAt ? formatDateTime(S.meta.lastBackupAt) : 'Henüz alınmadı';
   const standalone = isStandalone();
 
   return `
@@ -623,10 +623,11 @@ function viewSettings() {
 
     <div class="section-title">Yedekleme</div>
     <div class="list">
-      <button class="set-btn accent" data-action="export">Dışa aktar (JSON) <span class="val">Son: ${lb}</span></button>
-      <button class="set-btn accent" data-action="import">İçe aktar (JSON)</button>
+      <div class="set-row"><div class="grow">Son yedek</div><span class="muted pr">${lb}</span></div>
+      <button class="set-btn accent" data-action="export">Yedek al</button>
+      <button class="set-btn accent" data-action="import">Geri yükle</button>
     </div>
-    <div class="section-note">Yedek dosyası <b>şifresizdir</b>; güvenli bir yerde (ör. iCloud Drive'da kişisel bir klasör) sakla. İçe aktarma mevcut tüm verilerin yerine geçer.</div>
+    <div class="section-note">Yedek dosyası <b>şifresizdir</b>; güvenli bir yerde (ör. iCloud Drive'da kişisel bir klasör) sakla. Geri yükleme mevcut tüm verilerin yerine geçer.</div>
     <input type="file" id="import-file" accept="application/json,.json" class="hidden">
 
     <div class="section-title">Güvenlik</div>
@@ -886,7 +887,7 @@ function openPaymentSheet(kind, p = null) {
       ${history.length ? `
       <div class="field">
         <span class="field-label">Geçmiş ödemeler</span>
-        <div class="hist">${history.map(([per, v]) => `<div class="hist-row"><span>${formatMonth(per)}</span><span class="num">${formatTL(v.amount)}</span></div>`).join('')}</div>
+        <div class="hist">${history.map(([per, v]) => `<div class="hist-row"><span>${formatMonth(per)}</span><span class="num">${v.amount > 0 ? formatTL(v.amount) : 'İşaretlendi'}</span></div>`).join('')}</div>
       </div>` : ''}
       <div class="form-error"></div>
       <div class="form-actions">
@@ -953,7 +954,9 @@ function openPaySheet(kind, id) {
       <div class="form-error"></div>
       <div class="form-actions">
         <button class="btn btn-primary btn-block" type="submit">Ödendi olarak kaydet</button>
+        <button class="btn btn-block" type="button" data-action="mark-paid" data-kind="${kind}" data-id="${item.id}" data-period="${period}">Zaten ödedim, sadece işaretle</button>
       </div>
+      <div class="section-note">“Sadece işaretle” işlem oluşturmaz, bakiyelere dokunmaz; yalnızca uyarıyı kaldırır.</div>
     </form>`);
   if (!amount) $('#f-amount', sheet).focus();
 }
@@ -1196,6 +1199,39 @@ async function submitPay(form) {
   });
 }
 
+/** Uygulama dışında ödenmiş dönemi işlem oluşturmadan "ödendi" işaretler (bakiyeler değişmez). */
+async function markPaid(kind, id, period) {
+  const isCardPay = kind === 'card';
+  const item = isCardPay ? accountById(id) : paymentById(id);
+  if (!item || !isPeriod(period) || item.paid?.[period]) return;
+  const now = Date.now();
+  const entry = { at: todayISO(), amount: 0, txnId: null };
+  if (isCardPay) entry.mode = 'full';
+  const updated = { ...item, paid: { ...(item.paid || {}), [period]: entry }, updatedAt: now };
+  if (kind === 'loan') updated.remaining = Math.max(0, (item.remaining | 0) - 1);
+  const store = isCardPay ? 'accounts' : 'payments';
+  await commit({ [store]: [updated] });
+  haptic();
+  closeSheet();
+  render();
+  const usedRemaining = kind === 'loan' ? (item.remaining | 0) - updated.remaining : 0;
+  toast(`${item.name} ödendi olarak işaretlendi`, 5000, {
+    label: 'Geri al',
+    run: async () => {
+      const cur = isCardPay ? accountById(id) : paymentById(id);
+      if (cur && cur.paid?.[period] && !cur.paid[period].txnId) {
+        const paid = { ...cur.paid };
+        delete paid[period];
+        const rec = { ...cur, paid, updatedAt: Date.now() };
+        if (kind === 'loan') rec.remaining = (cur.remaining | 0) + usedRemaining;
+        await commit({ [store]: [rec] });
+      }
+      render();
+      toast('Geri alındı');
+    },
+  });
+}
+
 async function addCategory(form) {
   const input = form.elements.name;
   const name = input.value.trim().slice(0, 40);
@@ -1335,7 +1371,7 @@ function validateBackup(obj) {
     if (!isObj(paid)) throw new Error(err);
     const out = {};
     for (const [period, v] of Object.entries(paid)) {
-      if (!isPeriod(period) || !isObj(v) || !(Number.isSafeInteger(v.amount) && v.amount > 0)) throw new Error(err);
+      if (!isPeriod(period) || !isObj(v) || !(Number.isSafeInteger(v.amount) && v.amount >= 0)) throw new Error(err);
       const r = {
         at: typeof v.at === 'string' ? v.at.slice(0, 40) : Number.isFinite(v.at) ? v.at : null,
         amount: v.amount,
@@ -1784,6 +1820,7 @@ function bindEvents() {
       }
       case 'delete-payment': run(() => deletePayment(id)); break;
       case 'pay': openPaySheet(el.dataset.kind, id); break;
+      case 'mark-paid': run(() => markPaid(el.dataset.kind, id, el.dataset.period)); break;
       case 'close-sheet': closeSheet(); break;
       case 'toggle-sign': {
         const form = el.closest('form');
