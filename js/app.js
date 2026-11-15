@@ -2,8 +2,9 @@ import * as db from './db.js';
 import * as cr from './crypto.js';
 import { formatTL, formatPlain, parseAmount, todayISO, isValidISODate, formatDateLabel, formatDateTime, formatMonth, shiftMonth, esc } from './format.js';
 import * as sound from './sound.js';
+import * as pay from './payments.js';
 
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.5.0';
 const LOCK_AFTER_MS = 60 * 1000;
 const BACKUP_REMIND_DAYS = 14;
 
@@ -14,20 +15,29 @@ const DEFAULT_CATEGORIES = {
 
 /*
  * VERİ MODELİ (tutarlar kuruş cinsinden tam sayı)
- *  account:     { id, name, initialBalance, includeInTotal (yoksa true), order, createdAt, updatedAt }
+ *  account:     { id, name, initialBalance, includeInTotal (yoksa true), order, createdAt, updatedAt,
+ *                 kredi kartıysa: kind: 'card', dueDay (1..31), warnDays (vars. 7), limit (kuruş | null),
+ *                 firstPeriod: 'YYYY-MM', paid: { [period]: { at, amount, mode: 'full'|'min', txnId } } }
+ *                 (kind yoksa vadesiz; kart bakiyesi "kalan limit" olarak tutulur, borç = limit − bakiye)
  *  category:    { id, type: 'income'|'expense', name, order, createdAt }
  *  transaction: { id, type: 'income'|'expense'|'transfer', amount (>0), date: 'YYYY-MM-DD',
  *                 accountId, toAccountId (yalnız transfer), categoryId (transferde null),
  *                 note, recurringId (ileride tekrarlayan işlemler için), createdAt, updatedAt }
  *  recurring:   (ileride) — depo şimdiden mevcut, şu an boş.
+ *  payment:     { id, kind: 'loan'|'bill', name, dueDay, warnDays, firstPeriod, paid: { [period]: { at, amount, txnId } },
+ *                 createdAt, updatedAt,
+ *                 loan: amount (taksit, kuruş), remaining (kalan taksit; 0 = tamamlandı)
+ *                 bill: amounts: { [period]: kuruş } (ödemeden önce girilen fatura tutarı) }
+ *  period = 'YYYY-MM'; son ödeme tarihi/uyarı hesapları payments.js'te.
  */
 
 const $ = (s, el = document) => el.querySelector(s);
 
 const S = {
   dek: null,
-  data: { accounts: [], categories: [], transactions: [], recurring: [] },
+  data: { accounts: [], categories: [], transactions: [], recurring: [], payments: [] },
   view: 'main',
+  mainPage: 0,                   // ana ekranın yatay sayfası: 0 hesaplar, 1 ödemeler
   accountId: null,
   month: todayISO().slice(0, 7), // Hareketler ekranındaki ay (YYYY-MM)
   filter: 'all',                 // all | income | expense | transfer
@@ -46,6 +56,9 @@ const I = {
   list: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><circle cx="3.5" cy="6" r="1"/><circle cx="3.5" cy="12" r="1"/><circle cx="3.5" cy="18" r="1"/></svg>',
   next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>',
   lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
+  card: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="5" width="19" height="14" rx="2.5"/><path d="M2.5 10h19M6.5 15h4"/></svg>',
+  bank: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10 12 4l9 6"/><path d="M5 10v8M9.5 10v8M14.5 10v8M19 10v8M3 20h18"/></svg>',
+  bill: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6"/></svg>',
 };
 
 // ---------------------------------------------------------------- yardımcılar
@@ -62,6 +75,74 @@ const isCounted = id => accountById(id)?.includeInTotal !== false;
 const isVisibleTxn = t => (t.type === 'transfer' ? isCounted(t.accountId) || isCounted(t.toAccountId) : isCounted(t.accountId));
 const catName = id => categoryById(id)?.name ?? 'Kategorisiz';
 const sortTxns = list => list.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.createdAt - a.createdAt));
+
+// ---------------------------------------------------------------- ödemeler (kart / kredi / fatura)
+const paymentById = id => S.data.payments.find(p => p.id === id);
+/** Geçerli son ödeme günü olan kredi kartı hesabı mı? */
+const isCard = a => a?.kind === 'card' && Number.isInteger(a.dueDay) && a.dueDay >= 1 && a.dueDay <= 31;
+const hasPaid = o => !!o?.paid && Object.keys(o.paid).length > 0;
+const ALERT_LEVELS = ['warn', 'urgent', 'overdue'];
+const PERIOD_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+const isPeriod = v => typeof v === 'string' && PERIOD_RE.test(v);
+/** Kart borcu = limit − güncel bakiye (bakiye "kalan limit"). Limit yoksa null. */
+const cardDebt = (a, bal) => (a.limit > 0 ? Math.max(0, a.limit - (bal.get(a.id) || 0)) : null);
+/** Formdaki tam sayı alanı: boş/bozuk/aralık dışıysa NaN. */
+function intIn(v, min, max) {
+  const s = String(v ?? '').trim();
+  if (!/^\d{1,4}$/.test(s)) return NaN;
+  const n = Number(s);
+  return n >= min && n <= max ? n : NaN;
+}
+
+/** "Son ödeme: 12 Aralık · 5 gün kaldı" / "Ödendi · sonraki 12 Ocak" */
+function dueLine(st) {
+  if (st.level === 'paid') return `${st.lastPaid?.mode === 'min' ? 'Asgari ödendi' : 'Ödendi'} · sonraki ${pay.formatDayMonth(st.dueDate)}`;
+  return `Son ödeme: ${pay.formatDayMonth(st.dueDate)} · ${pay.dueText(st.days)}`;
+}
+
+/** Kartlar + krediler + faturalar tek listede; sıra: ödenmemişler (en yakın tarih), ödenmişler, tamamlanan krediler. */
+function dueEntries(bal, today = todayISO()) {
+  const out = [];
+  for (const a of S.data.accounts) {
+    if (!isCard(a)) continue;
+    const debt = cardDebt(a, bal);
+    out.push({
+      kind: 'card', id: a.id, name: a.name, st: pay.dueStatus(a, today), done: false,
+      amount: debt > 0 ? debt : null,
+      info: debt === null ? '' : debt > 0 ? `Borç ${formatTL(debt)}` : 'Borç yok',
+    });
+  }
+  for (const p of S.data.payments) {
+    if (p.kind === 'loan') {
+      const done = !(p.remaining > 0);
+      out.push({
+        kind: 'loan', id: p.id, name: p.name, st: done ? null : pay.dueStatus(p, today), done,
+        amount: done ? null : p.amount,
+        info: done ? 'Tüm taksitler ödendi' : `${formatTL(p.amount)} · ${p.remaining} taksit kaldı`,
+      });
+    } else {
+      const st = pay.dueStatus(p, today);
+      const amt = p.amounts?.[st.period];
+      let info = amt > 0 ? formatTL(amt) : 'Tutar girilmedi';
+      if (!(amt > 0) && st.level === 'paid' && st.lastPaid?.amount > 0) info = `Son ödenen ${formatTL(st.lastPaid.amount)}`;
+      out.push({ kind: 'bill', id: p.id, name: p.name, st, done: false, amount: amt > 0 ? amt : null, info });
+    }
+  }
+  const rank = e => (e.done ? 2 : e.st.level === 'paid' ? 1 : 0);
+  return out.sort((a, b) => rank(a) - rank(b)
+    || (a.done || b.done ? 0 : a.st.days - b.st.days)
+    || a.name.localeCompare(b.name, 'tr'));
+}
+
+/** Gider kategorisini adıyla bul (büyük/küçük harf duyarsız); yoksa yeni kayıt hazırla (commit'i çağıran yapar). */
+function expenseCategoryNamed(name) {
+  const key = name.toLocaleLowerCase('tr');
+  const cats = categoriesOf('expense');
+  const found = cats.find(c => c.name.toLocaleLowerCase('tr') === key);
+  if (found) return { cat: found, created: false };
+  const order = cats.reduce((m, c) => Math.max(m, c.order), -1) + 1;
+  return { cat: { id: cr.uuid(), type: 'expense', name, order, createdAt: Date.now() }, created: true };
+}
 
 function computeBalances() {
   const m = new Map(S.data.accounts.map(a => [a.id, a.initialBalance]));
@@ -148,16 +229,63 @@ function defaultCategories() {
 function render() {
   if (!S.dek) return;
   openSwipe = null;
+  pagerRO?.disconnect();
+  pagerRO = null;
   const app = $('#app');
   if (S.view === 'account' && !accountById(S.accountId)) S.view = 'main';
-  if (S.view === 'main') app.innerHTML = viewMain();
+  if (S.view === 'main') { app.innerHTML = viewMain(); setupPager(); }
   else if (S.view === 'account') app.innerHTML = viewAccount();
   else if (S.view === 'settings') app.innerHTML = viewSettings();
   else if (S.view === 'activity') app.innerHTML = viewActivity();
 }
 
+// ---------------------------------------------------------------- ana ekran sayfaları (yatay kaydırma)
+let pagerRO = null; // sayfa yüksekliği değişince kaydırıcı yüksekliğini güncelleyen gözlemci
+
+function updateDots(i) {
+  document.querySelectorAll('.pager-dots .pdot').forEach((d, k) => {
+    d.classList.toggle('on', k === i);
+    if (k === i) d.setAttribute('aria-current', 'true'); else d.removeAttribute('aria-current');
+  });
+}
+
+/** Render sonrası: sayfa konumunu animasyonsuz geri yükle, yüksekliği etkin sayfaya eşitle
+ *  (kısa sayfada boş alan kalmasın), kaydırma bitince etkin sayfayı kaydet. */
+function setupPager() {
+  const pager = $('#pager');
+  if (!pager) return;
+  const pages = [...pager.children];
+  if (S.mainPage >= pages.length) S.mainPage = 0;
+  const fit = () => {
+    const p = pages[S.mainPage] || pages[0];
+    pager.style.height = `${p.offsetHeight}px`;
+  };
+  pager.scrollLeft = S.mainPage * pager.clientWidth;
+  fit();
+  updateDots(S.mainPage);
+  if (window.ResizeObserver) {
+    pagerRO = new ResizeObserver(() => { if (pager.isConnected) fit(); });
+    pages.forEach(p => pagerRO.observe(p));
+  }
+  let settle;
+  pager.addEventListener('scroll', () => {
+    const w = pager.clientWidth || 1;
+    updateDots(Math.round(pager.scrollLeft / w));
+    clearTimeout(settle);
+    settle = setTimeout(() => {
+      if (!pager.isConnected) return;
+      const i = Math.max(0, Math.min(pages.length - 1, Math.round(pager.scrollLeft / w)));
+      if (i === S.mainPage) return;
+      S.mainPage = i;
+      fit();
+      if (window.scrollY > 0) window.scrollTo(0, 0);
+    }, 120);
+  }, { passive: true });
+}
+
 function go(view, accountId = null) {
   if (view === 'activity' && S.view !== 'activity') { S.month = todayISO().slice(0, 7); S.filter = 'all'; }
+  if (view === 'main' && S.view !== 'main') S.mainPage = 0;
   S.view = view;
   S.accountId = accountId;
   render();
@@ -180,13 +308,22 @@ function viewMain() {
     .sort((a, b) => (bal.get(b.id) || 0) - (bal.get(a.id) || 0)); // Array.sort kararlı: eşitlikte elle sıra korunur
   const excluded = accs.filter(a => !isCounted(a.id));
 
+  const today = todayISO();
+  const entries = dueEntries(bal, today);
+  const alerts = entries.filter(e => !e.done && ALERT_LEVELS.includes(e.st.level));
+  const alertsHtml = alerts.length
+    ? `<div class="alerts" role="region" aria-label="Yaklaşan ödemeler">${alerts.map(alertRow).join('')}</div>`
+    : '';
+
   const card = a => {
     const b = bal.get(a.id) || 0;
     const counted = isCounted(a.id);
+    const st = isCard(a) ? pay.dueStatus(a, today) : null;
     return `<div class="card ${counted ? '' : 'excluded'}" data-action="open-account" data-id="${a.id}">
       <div class="card-info">
         <div class="card-name">${esc(a.name)}</div>
         <div class="card-bal num ${signClass(b)}">${formatTL(b)}</div>
+        ${st ? `<div class="card-due due lv-${st.level}">${esc(dueLine(st))}</div>` : ''}
       </div>
       <div class="card-btns">
         <button class="round-btn minus" data-action="add-expense" data-id="${a.id}" aria-label="${esc(a.name)} gider ekle">−</button>
@@ -209,17 +346,76 @@ function viewMain() {
         <button class="icon-btn" data-action="settings" aria-label="Ayarlar">${I.gear}</button>
       </div>
     </header>
-    <section class="total">
-      <div class="label">Toplam Para</div>
-      <div class="amount num ${signClass(total)}">${formatTL(total)}</div>
-      ${monthPill()}
-    </section>
-    ${banner}
-    ${accs.length
-      ? `<div class="cards">${cards}</div><button class="add-row" data-action="new-account">+ Hesap ekle</button>`
-      : `<div class="empty"><p>Henüz hesap yok.<br>Ziraat, Garanti, Papara, Nakit… ne kullanıyorsan ekle.</p>
-         <button class="btn btn-primary" data-action="new-account">+ İlk hesabı ekle</button></div>`}
+    <div class="pager" id="pager">
+      <section class="page" aria-label="Hesaplar">
+        <section class="total">
+          <div class="label">Toplam Para</div>
+          <div class="amount num ${signClass(total)}">${formatTL(total)}</div>
+          ${monthPill()}
+        </section>
+        ${alertsHtml}
+        ${banner}
+        ${accs.length
+          ? `<div class="cards">${cards}</div><button class="add-row" data-action="new-account">+ Hesap ekle</button>`
+          : `<div class="empty"><p>Henüz hesap yok.<br>Ziraat, Garanti, Papara, Nakit… ne kullanıyorsan ekle.</p>
+             <button class="btn btn-primary" data-action="new-account">+ İlk hesabı ekle</button></div>`}
+      </section>
+      <section class="page" aria-label="Ödemeler">${paymentsPage(entries)}</section>
+    </div>
+    <div class="pager-dots">
+      <button class="pdot" data-action="main-page" data-p="0" aria-label="Hesaplar sayfası"></button>
+      <button class="pdot" data-action="main-page" data-p="1" aria-label="Ödemeler sayfası"></button>
+    </div>
   `;
+}
+
+/** Ana ekrandaki uyarı satırı (yalnız warn/urgent/overdue, ödenmemiş). */
+function alertRow(e) {
+  return `<div class="alert lv-${e.st.level}">
+    <div class="alert-main">
+      <div class="alert-name">${esc(e.name)}</div>
+      <div class="alert-sub"><span class="due">${esc(pay.dueText(e.st.days))}</span>${e.amount ? ` · <span class="num">${formatTL(e.amount)}</span>` : ''}</div>
+    </div>
+    <button class="btn-pay" data-action="pay" data-kind="${e.kind}" data-id="${e.id}" aria-label="${esc(e.name)} ödendi olarak işaretle">Ödendi</button>
+  </div>`;
+}
+
+const PAY_TYPES = { card: ['Kart', I.card], loan: ['Kredi', I.bank], bill: ['Fatura', I.bill] };
+
+/** Ödemeler sayfasındaki satır: dokununca düzenleme, sağda "Ödendi". (.swipe yok: yatay sayfa kaydırmayla çakışmasın) */
+function payRow(e) {
+  const [label, icon] = PAY_TYPES[e.kind];
+  const paidLevel = !e.done && e.st.level === 'paid';
+  const due = e.done
+    ? '<div class="row-sub">Tamamlandı</div>'
+    : `<div class="row-sub due lv-${e.st.level}">${esc(dueLine(e.st))}</div>`;
+  return `<div class="pay-row ${e.done || paidLevel ? 'faded' : ''}">
+    <button class="pay-main" data-action="${e.kind === 'card' ? 'edit-account' : 'edit-payment'}" data-id="${e.id}" aria-label="${esc(e.name)} düzenle">
+      <div class="row-icon pay-${e.kind}">${icon}</div>
+      <div class="row-main">
+        <div class="row-title">${esc(e.name)}<span class="tag">${label}</span></div>
+        ${due}
+        ${e.info ? `<div class="row-sub num">${esc(e.info)}</div>` : ''}
+      </div>
+    </button>
+    ${e.done ? '' : `<button class="btn-pay ${paidLevel ? 'quiet' : ''}" data-action="pay" data-kind="${e.kind}" data-id="${e.id}" aria-label="${esc(e.name)} ödendi olarak işaretle">Ödendi</button>`}
+  </div>`;
+}
+
+function paymentsPage(entries) {
+  const pending = entries.filter(e => !e.done && e.st.level !== 'paid').length;
+  return `
+    <div class="page-head">
+      <h2>Ödemeler</h2>
+      ${entries.length ? `<span class="muted">${pending ? `${pending} bekleyen` : 'Hepsi ödendi'}</span>` : ''}
+    </div>
+    ${entries.length
+      ? `<div class="list">${entries.map(payRow).join('')}</div>`
+      : `<div class="empty"><p>Henüz takip edilen ödeme yok.<br>Kredi kartı için hesaba dokunup düzenle → <b>Kredi kartı</b> seç; kredi ve faturaları aşağıdan ekle.</p></div>`}
+    <div class="pay-adds">
+      <button class="add-row" data-action="new-loan">+ Kredi ekle</button>
+      <button class="add-row" data-action="new-bill">+ Fatura ekle</button>
+    </div>`;
 }
 
 function txnRow(t, perspectiveId) {
@@ -390,7 +586,7 @@ function viewSettings() {
   const accs = sortedAccounts();
   const accRows = accs.map((a, i) => `
     <div class="set-row">
-      <div class="grow">${esc(a.name)}${isCounted(a.id) ? '' : '<span class="tag">Dahil değil</span>'}</div>
+      <div class="grow">${esc(a.name)}${isCard(a) ? '<span class="tag">Kart</span>' : ''}${isCounted(a.id) ? '' : '<span class="tag">Dahil değil</span>'}</div>
       <button class="icon-btn" data-action="move-account" data-id="${a.id}" data-dir="-1" ${i === 0 ? 'disabled' : ''} aria-label="Yukarı taşı">${I.up}</button>
       <button class="icon-btn" data-action="move-account" data-id="${a.id}" data-dir="1" ${i === accs.length - 1 ? 'disabled' : ''} aria-label="Aşağı taşı">${I.down}</button>
       <button class="icon-btn" data-action="edit-account" data-id="${a.id}" aria-label="Düzenle">${I.edit}</button>
@@ -582,12 +778,20 @@ function openTransferSheet(fromId, txn = null) {
 
 function openAccountSheet(acc = null) {
   const neg = acc ? acc.initialBalance < 0 : false;
+  const card = acc?.kind === 'card';
   const sheet = openSheet(`
     ${sheetHead(acc ? 'Hesabı düzenle' : 'Yeni hesap')}
-    <form data-form="account" ${acc ? `data-id="${acc.id}"` : ''} novalidate>
+    <form data-form="account" class="acc-form ${card ? 'is-card' : ''}" ${acc ? `data-id="${acc.id}"` : ''} novalidate>
       <div class="field">
         <label for="f-name">Hesap adı</label>
         <input id="f-name" name="name" class="input" maxlength="40" autocomplete="off" placeholder="ör. Ziraat, Papara, Nakit" value="${esc(acc?.name ?? '')}" enterkeyhint="next">
+      </div>
+      <div class="field">
+        <span class="field-label">Hesap türü</span>
+        <div class="cat-pick choice">
+          <input type="radio" name="kind" id="k-plain" value="plain" ${card ? '' : 'checked'}><label for="k-plain">Vadesiz hesap</label>
+          <input type="radio" name="kind" id="k-card" value="card" ${card ? 'checked' : ''}><label for="k-card">Kredi kartı</label>
+        </div>
       </div>
       <div class="field">
         <label for="f-amount">Başlangıç bakiyesi</label>
@@ -599,7 +803,25 @@ function openAccountSheet(acc = null) {
         </div>
       </div>
       <input type="hidden" name="sign" value="${neg ? '-1' : '1'}">
-      <div class="section-note">Kredi kartı borcu gibi eksi bakiye için işareti − yap.${acc ? ' Başlangıç bakiyesini değiştirmek güncel bakiyeyi aynı miktarda değiştirir.' : ''}</div>
+      <div class="section-note plain-only">Kredi kartı borcu gibi eksi bakiye için işareti − yap.${acc ? ' Başlangıç bakiyesini değiştirmek güncel bakiyeyi aynı miktarda değiştirir.' : ''}</div>
+      <div class="card-fields">
+        <div class="section-note">Kart bakiyesini <b>kalan limit</b> olarak tut (ör. 2.000 TL limitli kart için 2.000); harcadıkça azalır.${acc ? ' Başlangıç bakiyesini değiştirmek güncel bakiyeyi aynı miktarda değiştirir.' : ''}</div>
+        <div class="field-row">
+          <div class="field">
+            <label for="f-dueday">Son ödeme günü</label>
+            <input id="f-dueday" name="dueDay" class="input" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off" placeholder="1–31" value="${esc(acc?.dueDay ?? '')}" enterkeyhint="next">
+          </div>
+          <div class="field">
+            <label for="f-warn">Uyarı (kaç gün kala)</label>
+            <input id="f-warn" name="warnDays" class="input" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off" value="${esc(acc?.warnDays ?? pay.DEFAULT_WARN_DAYS)}" enterkeyhint="next">
+          </div>
+        </div>
+        <div class="field">
+          <label for="f-limit">Kart limiti (isteğe bağlı)</label>
+          <input id="f-limit" name="limit" class="input" inputmode="decimal" autocomplete="off" placeholder="ör. 20.000" value="${acc?.limit > 0 ? formatPlain(acc.limit) : ''}" enterkeyhint="done">
+        </div>
+        <div class="section-note">Limit girersen kart borcu (limit − kalan limit) hesaplanır ve “Ödendi”de hazır gelir.</div>
+      </div>
       <label class="switch-row">
         <span class="switch-text">
           <span>Toplam bakiyeye dahil</span>
@@ -617,6 +839,123 @@ function openAccountSheet(acc = null) {
       </div>
     </form>`);
   if (!acc) $('#f-name', sheet).focus();
+}
+
+/** Kredi / fatura ekle-düzenle paneli. */
+function openPaymentSheet(kind, p = null) {
+  const loan = kind === 'loan';
+  const today = todayISO();
+  const period = p ? pay.nextPeriod(p, today) : null;
+  const billAmt = !loan && p && p.amounts?.[period] > 0 ? formatPlain(p.amounts[period]) : '';
+  const history = !loan && p
+    ? Object.entries(p.paid || {}).sort((a, b) => (a[0] < b[0] ? 1 : a[0] > b[0] ? -1 : 0)).slice(0, 24)
+    : [];
+  const title = p ? (loan ? 'Krediyi düzenle' : 'Faturayı düzenle') : (loan ? 'Kredi ekle' : 'Fatura ekle');
+  const sheet = openSheet(`
+    ${sheetHead(title)}
+    <form data-form="payment" data-kind="${kind}" ${p ? `data-id="${p.id}"` : ''} novalidate>
+      <div class="field">
+        <label for="p-name">${loan ? 'Kredi adı' : 'Fatura adı'}</label>
+        <input id="p-name" name="name" class="input" maxlength="40" autocomplete="off" placeholder="${loan ? 'ör. İhtiyaç kredisi' : 'ör. Elektrik, Su, İnternet'}" value="${esc(p?.name ?? '')}" enterkeyhint="next">
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="p-day">${loan ? 'Ödeme günü' : 'Son ödeme günü'}</label>
+          <input id="p-day" name="dueDay" class="input" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off" placeholder="1–31" value="${esc(p?.dueDay ?? '')}" enterkeyhint="next">
+        </div>
+        <div class="field">
+          <label for="p-warn">Uyarı (kaç gün kala)</label>
+          <input id="p-warn" name="warnDays" class="input" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off" value="${esc(p?.warnDays ?? pay.DEFAULT_WARN_DAYS)}" enterkeyhint="next">
+        </div>
+      </div>
+      ${loan ? `
+      <div class="field-row">
+        <div class="field">
+          <label for="p-amount">Taksit tutarı</label>
+          <input id="p-amount" name="amount" class="input num" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${p ? formatPlain(p.amount) : ''}" enterkeyhint="next">
+        </div>
+        <div class="field">
+          <label for="p-remaining">Kalan taksit</label>
+          <input id="p-remaining" name="remaining" class="input num" inputmode="numeric" pattern="[0-9]*" maxlength="3" autocomplete="off" placeholder="ör. 18" value="${esc(p?.remaining ?? '')}" enterkeyhint="done">
+        </div>
+      </div>` : `
+      <div class="field">
+        <label for="p-amount">Bu dönemin tutarı (isteğe bağlı)${period ? ` · ${formatMonth(period)}` : ''}</label>
+        <input id="p-amount" name="amount" class="input num" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${billAmt}" enterkeyhint="done">
+      </div>`}
+      ${history.length ? `
+      <div class="field">
+        <span class="field-label">Geçmiş ödemeler</span>
+        <div class="hist">${history.map(([per, v]) => `<div class="hist-row"><span>${formatMonth(per)}</span><span class="num">${formatTL(v.amount)}</span></div>`).join('')}</div>
+      </div>` : ''}
+      <div class="form-error"></div>
+      <div class="form-actions">
+        <button class="btn btn-primary btn-block" type="submit">Kaydet</button>
+        ${p ? `<button class="btn btn-danger btn-block" type="button" data-action="delete-payment" data-id="${p.id}">${loan ? 'Krediyi sil' : 'Faturayı sil'}</button>` : ''}
+      </div>
+    </form>`);
+  if (!p) $('#p-name', sheet).focus();
+}
+
+/** "Ödendi" paneli: her zaman sıradaki ödenmemiş dönem için. */
+function openPaySheet(kind, id) {
+  const today = todayISO();
+  const isCardPay = kind === 'card';
+  const item = isCardPay ? accountById(id) : paymentById(id);
+  if (!item || (isCardPay && !isCard(item))) return;
+  if (kind === 'loan' && !(item.remaining > 0)) { toast('Bu kredinin tüm taksitleri ödendi.'); return; }
+  const others = sortedAccounts().filter(a => a.id !== item.id);
+  if (!others.length) {
+    toast(isCardPay ? 'Kartı ödemek için önce başka bir hesap (ör. vadesiz) ekle.' : 'Ödeme için önce bir hesap ekle.', 3500);
+    return;
+  }
+  const st = pay.dueStatus(item, today);
+  const period = st.period;
+  const src = (others.find(a => !isCard(a)) || others[0]).id;
+  let full = '';
+  let amount = '';
+  if (isCardPay) {
+    const debt = cardDebt(item, computeBalances());
+    if (debt > 0) full = formatPlain(debt);
+    amount = full;
+  } else if (kind === 'loan') amount = formatPlain(item.amount);
+  else if (item.amounts?.[period] > 0) amount = formatPlain(item.amounts[period]);
+
+  const sheet = openSheet(`
+    ${sheetHead(`Ödendi: ${esc(item.name)}`)}
+    <form data-form="pay" data-kind="${kind}" data-id="${item.id}" data-period="${period}" data-full="${full}" novalidate>
+      <div class="section-note">${formatMonth(period)} dönemi · son ödeme ${esc(pay.formatDayMonth(st.dueDate))} (${esc(pay.dueText(st.days))})</div>
+      ${isCardPay ? `
+      <div class="field">
+        <span class="field-label">Ödeme</span>
+        <div class="cat-pick choice">
+          <input type="radio" name="mode" id="m-full" value="full" checked><label for="m-full">Tamamı</label>
+          <input type="radio" name="mode" id="m-min" value="min"><label for="m-min">Asgari</label>
+        </div>
+      </div>` : ''}
+      <div class="field">
+        <div class="amount-field ${isCardPay ? '' : 'expense'}">
+          <span class="cur">${isCardPay ? '' : '−'}₺</span>
+          <input id="f-amount" name="amount" inputmode="decimal" autocomplete="off" placeholder="0,00" enterkeyhint="done" value="${amount}" aria-label="Ödenen tutar">
+        </div>
+      </div>
+      <div class="field">
+        <label for="f-account">Hangi hesaptan</label>
+        <select id="f-account" name="accountId" class="input">${accountOptions(src, item.id)}</select>
+      </div>
+      <div class="field">
+        <label for="f-date">Tarih</label>
+        <input id="f-date" name="date" type="date" class="input" value="${today}" required>
+      </div>
+      <div class="section-note">${isCardPay
+        ? 'Seçilen hesaptan karta transfer olarak kaydedilir; kartın kalan limiti artar.'
+        : `Gider olarak “${kind === 'loan' ? 'Kredi' : 'Fatura'}” kategorisine kaydedilir.`}</div>
+      <div class="form-error"></div>
+      <div class="form-actions">
+        <button class="btn btn-primary btn-block" type="submit">Ödendi olarak kaydet</button>
+      </div>
+    </form>`);
+  if (!amount) $('#f-amount', sheet).focus();
 }
 
 // ---------------------------------------------------------------- onay penceresi
@@ -706,13 +1045,155 @@ async function submitAccount(form) {
   const old = form.dataset.id ? accountById(form.dataset.id) : null;
   const maxOrder = S.data.accounts.reduce((m, a) => Math.max(m, a.order), -1);
   const includeInTotal = !!form.elements.include?.checked;
+
+  // Kredi kartı alanları
+  let cardFields = null;
+  if (f.get('kind') === 'card') {
+    const dueDay = intIn(f.get('dueDay'), 1, 31);
+    if (Number.isNaN(dueDay)) return setFormError('Son ödeme günü 1–31 arasında olmalı.');
+    const wr = String(f.get('warnDays') || '').trim();
+    const warnDays = wr ? intIn(wr, 0, 31) : pay.DEFAULT_WARN_DAYS;
+    if (Number.isNaN(warnDays)) return setFormError('Uyarı günü 0–31 arasında olmalı.');
+    const lr = String(f.get('limit') || '').trim();
+    const limit = lr ? parseAmount(lr) : null;
+    if (lr && (!Number.isFinite(limit) || limit <= 0)) return setFormError('Geçerli bir kart limiti gir ya da boş bırak.');
+    // Karta yeni çevrildiyse ya da gün değişip hiç ödeme yoksa dönem takibi bugünden başlar.
+    const keep = old?.kind === 'card' && isPeriod(old.firstPeriod) && (old.dueDay === dueDay || hasPaid(old));
+    cardFields = {
+      kind: 'card', dueDay, warnDays, limit,
+      firstPeriod: keep ? old.firstPeriod : pay.firstPeriodFor(dueDay, todayISO()),
+      paid: old?.paid && typeof old.paid === 'object' ? old.paid : {},
+    };
+  }
+
   const acc = old
     ? { ...old, name, initialBalance: amount, includeInTotal, updatedAt: now }
     : { id: cr.uuid(), name, initialBalance: amount, includeInTotal, order: maxOrder + 1, createdAt: now, updatedAt: now };
+  if (cardFields) Object.assign(acc, cardFields);
+  else delete acc.kind; // vadesize dönüş: diğer kart alanları kalır ama yok sayılır
   await commit({ accounts: [acc] });
   closeSheet();
   render();
   toast(old ? 'Hesap güncellendi' : `${name} eklendi`);
+}
+
+async function submitPayment(form) {
+  const f = new FormData(form);
+  const kind = form.dataset.kind === 'loan' ? 'loan' : 'bill';
+  const name = String(f.get('name') || '').trim().slice(0, 40);
+  if (!name) return setFormError(kind === 'loan' ? 'Kredi adı gir.' : 'Fatura adı gir.');
+  const dueDay = intIn(f.get('dueDay'), 1, 31);
+  if (Number.isNaN(dueDay)) return setFormError('Ödeme günü 1–31 arasında olmalı.');
+  const wr = String(f.get('warnDays') || '').trim();
+  const warnDays = wr ? intIn(wr, 0, 31) : pay.DEFAULT_WARN_DAYS;
+  if (Number.isNaN(warnDays)) return setFormError('Uyarı günü 0–31 arasında olmalı.');
+  const old = form.dataset.id ? paymentById(form.dataset.id) : null;
+  const now = Date.now();
+  const today = todayISO();
+  const keep = old && isPeriod(old.firstPeriod) && (old.dueDay === dueDay || hasPaid(old));
+  const firstPeriod = keep ? old.firstPeriod : pay.firstPeriodFor(dueDay, today);
+  const p = old
+    ? { ...old, name, dueDay, warnDays, firstPeriod, updatedAt: now }
+    : { id: cr.uuid(), kind, name, dueDay, warnDays, firstPeriod, paid: {}, createdAt: now, updatedAt: now };
+  const raw = String(f.get('amount') || '').trim();
+  if (kind === 'loan') {
+    const amount = parseAmount(raw);
+    if (!Number.isFinite(amount) || amount <= 0) return setFormError('Geçerli bir taksit tutarı gir.');
+    const remaining = intIn(f.get('remaining'), 0, 999);
+    if (Number.isNaN(remaining)) return setFormError('Kalan taksit sayısını gir (0 veya daha fazla).');
+    p.amount = amount;
+    p.remaining = remaining;
+  } else {
+    const amounts = { ...(old?.amounts || {}) };
+    const period = pay.nextPeriod(p, today);
+    if (raw) {
+      const amount = parseAmount(raw);
+      if (!Number.isFinite(amount) || amount <= 0) return setFormError('Geçerli bir tutar gir ya da boş bırak.');
+      amounts[period] = amount;
+    } else delete amounts[period];
+    p.amounts = amounts;
+  }
+  await commit({ payments: [p] });
+  haptic();
+  closeSheet();
+  render();
+  toast(old ? 'Kaydedildi' : `${name} eklendi`);
+}
+
+async function deletePayment(id) {
+  const p = paymentById(id);
+  if (!p) return;
+  const ok = await confirmDialog({
+    title: `“${p.name}” silinsin mi?`,
+    message: 'Geçmiş ödeme işlemleri silinmez; Hareketler\'de kalır.',
+    ok: 'Sil', danger: true,
+  });
+  if (!ok) return;
+  await commit({}, { payments: [id] });
+  closeSheet();
+  render();
+  toast('Silindi');
+}
+
+/** "Ödendi": işlem + paid kaydı (+ kredide kalan taksit) tek commit'te; toast'ta "Geri al". */
+async function submitPay(form) {
+  const { kind, id, period } = form.dataset;
+  const isCardPay = kind === 'card';
+  const item = isCardPay ? accountById(id) : paymentById(id);
+  if (!item || !isPeriod(period)) return setFormError('Kayıt bulunamadı.');
+  if (item.paid?.[period]) return setFormError('Bu dönem zaten ödenmiş.');
+  const f = new FormData(form);
+  const amount = parseAmount(f.get('amount'));
+  if (!Number.isFinite(amount) || amount <= 0) return setFormError('Geçerli bir tutar gir (ör. 1250,50).');
+  const accountId = f.get('accountId');
+  if (!accountById(accountId)) return setFormError('Hangi hesaptan ödendiğini seç.');
+  if (isCardPay && accountId === item.id) return setFormError('Kart kendisinden ödenemez; başka bir hesap seç.');
+  const date = f.get('date');
+  if (!isValidISODate(date)) return setFormError('Geçerli bir tarih seç.');
+  const now = Date.now();
+  const txnId = cr.uuid();
+  const puts = {};
+  let txn, updated;
+  if (isCardPay) {
+    const mode = f.get('mode') === 'min' ? 'min' : 'full';
+    txn = { id: txnId, type: 'transfer', amount, accountId, toAccountId: item.id, categoryId: null,
+      note: mode === 'min' ? 'Asgari ödeme' : 'Kredi kartı ödemesi', date, recurringId: null, createdAt: now, updatedAt: now };
+    updated = { ...item, paid: { ...(item.paid || {}), [period]: { at: date, amount, mode, txnId } }, updatedAt: now };
+    puts.accounts = [updated];
+  } else {
+    const { cat, created } = expenseCategoryNamed(kind === 'loan' ? 'Kredi' : 'Fatura');
+    if (created) puts.categories = [cat];
+    txn = { id: txnId, type: 'expense', amount, accountId, toAccountId: null, categoryId: cat.id,
+      note: String(item.name).slice(0, 200), date, recurringId: null, createdAt: now, updatedAt: now };
+    updated = { ...item, paid: { ...(item.paid || {}), [period]: { at: date, amount, txnId } }, updatedAt: now };
+    if (kind === 'loan') updated.remaining = Math.max(0, (item.remaining | 0) - 1);
+    puts.payments = [updated];
+  }
+  puts.transactions = [txn];
+  await commit(puts);
+  if (!isCardPay) sound.playExpense();
+  haptic();
+  closeSheet();
+  render();
+  const usedRemaining = kind === 'loan' ? (item.remaining | 0) - updated.remaining : 0;
+  toast(`${item.name} ödendi`, 5000, {
+    label: 'Geri al',
+    run: async () => {
+      // Güncel kaydı esas al (arada düzenlenmiş olabilir); yalnız bu ödemenin izini sil.
+      const cur = isCardPay ? accountById(id) : paymentById(id);
+      const back = {};
+      if (cur && cur.paid?.[period]?.txnId === txnId) {
+        const paid = { ...cur.paid };
+        delete paid[period];
+        const rec = { ...cur, paid, updatedAt: Date.now() };
+        if (kind === 'loan') rec.remaining = (cur.remaining | 0) + usedRemaining;
+        back[isCardPay ? 'accounts' : 'payments'] = [rec];
+      }
+      await commit(back, { transactions: [txnId] });
+      render();
+      toast('Geri alındı');
+    },
+  });
 }
 
 async function addCategory(form) {
@@ -805,6 +1286,7 @@ function buildBackup() {
     categories: S.data.categories,
     transactions: S.data.transactions,
     recurring: S.data.recurring,
+    payments: S.data.payments,
   };
 }
 
@@ -844,10 +1326,41 @@ function validateBackup(obj) {
   const str = (v, max) => String(v ?? '').slice(0, max);
   const int = v => (Number.isSafeInteger(v) ? v : NaN);
   const now = Date.now();
+  const today = todayISO();
+  const dayOk = (v, min, max) => Number.isInteger(v) && v >= min && v <= max;
+  const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v);
+  /** paid: { 'YYYY-MM': { at, amount, txnId, (mode) } } — bozuksa hata. */
+  const cleanPaid = (paid, withMode, err) => {
+    if (paid == null) return {};
+    if (!isObj(paid)) throw new Error(err);
+    const out = {};
+    for (const [period, v] of Object.entries(paid)) {
+      if (!isPeriod(period) || !isObj(v) || !(Number.isSafeInteger(v.amount) && v.amount > 0)) throw new Error(err);
+      const r = {
+        at: typeof v.at === 'string' ? v.at.slice(0, 40) : Number.isFinite(v.at) ? v.at : null,
+        amount: v.amount,
+        txnId: v.txnId ? str(v.txnId, 64) : null,
+      };
+      if (withMode) r.mode = v.mode === 'min' ? 'min' : 'full';
+      out[period] = r;
+    }
+    return out;
+  };
 
   const accounts = (obj.accounts || []).map((a, i) => {
     const r = { id: str(a.id, 64), name: str(a.name, 40).trim(), initialBalance: int(a.initialBalance), includeInTotal: a.includeInTotal !== false, order: Number.isFinite(a.order) ? a.order : i, createdAt: a.createdAt || now, updatedAt: a.updatedAt || now };
-    if (!r.id || !r.name || Number.isNaN(r.initialBalance)) throw new Error(`Hatalı hesap kaydı (#${i + 1}).`);
+    const err = `Hatalı hesap kaydı (#${i + 1}).`;
+    if (!r.id || !r.name || Number.isNaN(r.initialBalance)) throw new Error(err);
+    if (a.kind === 'card') {
+      const warnDays = a.warnDays ?? pay.DEFAULT_WARN_DAYS;
+      const limit = a.limit ?? null;
+      if (!dayOk(a.dueDay, 1, 31) || !dayOk(warnDays, 0, 31) || (limit !== null && !(Number.isSafeInteger(limit) && limit >= 0))) throw new Error(err);
+      Object.assign(r, {
+        kind: 'card', dueDay: a.dueDay, warnDays, limit: limit > 0 ? limit : null,
+        firstPeriod: isPeriod(a.firstPeriod) ? a.firstPeriod : pay.firstPeriodFor(a.dueDay, today),
+        paid: cleanPaid(a.paid, true, err),
+      });
+    }
     return r;
   });
   const accIds = new Set(accounts.map(a => a.id));
@@ -870,12 +1383,39 @@ function validateBackup(obj) {
     return r;
   });
   const recurring = Array.isArray(obj.recurring) ? obj.recurring.filter(x => x && x.id) : [];
+  // Eski yedeklerde payments yok → boş.
+  const payments = (Array.isArray(obj.payments) ? obj.payments : []).map((p, i) => {
+    const err = `Hatalı ödeme kaydı (#${i + 1}).`;
+    if (!isObj(p)) throw new Error(err);
+    const warnDays = p.warnDays ?? pay.DEFAULT_WARN_DAYS;
+    const r = {
+      id: str(p.id, 64), kind: p.kind, name: str(p.name, 40).trim(), dueDay: p.dueDay, warnDays,
+      firstPeriod: null, paid: {}, createdAt: p.createdAt || now, updatedAt: p.updatedAt || now,
+    };
+    if (!r.id || !r.name || !['loan', 'bill'].includes(r.kind) || !dayOk(r.dueDay, 1, 31) || !dayOk(warnDays, 0, 31)) throw new Error(err);
+    r.firstPeriod = isPeriod(p.firstPeriod) ? p.firstPeriod : pay.firstPeriodFor(r.dueDay, today);
+    r.paid = cleanPaid(p.paid, false, err);
+    if (r.kind === 'loan') {
+      if (!(Number.isSafeInteger(p.amount) && p.amount > 0) || !(Number.isSafeInteger(p.remaining) && p.remaining >= 0)) throw new Error(err);
+      r.amount = p.amount;
+      r.remaining = p.remaining;
+    } else {
+      const am = p.amounts ?? {};
+      if (!isObj(am)) throw new Error(err);
+      r.amounts = {};
+      for (const [k, v] of Object.entries(am)) {
+        if (!isPeriod(k) || !(Number.isSafeInteger(v) && v > 0)) throw new Error(err);
+        r.amounts[k] = v;
+      }
+    }
+    return r;
+  });
   for (const type of ['income', 'expense']) {
     if (!categories.some(c => c.type === type)) {
       DEFAULT_CATEGORIES[type].forEach((name, i) => categories.push({ id: cr.uuid(), type, name, order: i, createdAt: now + i }));
     }
   }
-  return { accounts, categories, transactions, recurring };
+  return { accounts, categories, transactions, recurring, payments };
 }
 
 async function importBackup(file) {
@@ -889,14 +1429,14 @@ async function importBackup(file) {
   }
   const ok = await confirmDialog({
     title: 'Yedek yüklensin mi?',
-    message: `Yedekte ${data.accounts.length} hesap ve ${data.transactions.length} işlem var.\nMevcut TÜM veriler silinip yedekle değiştirilecek.`,
+    message: `Yedekte ${data.accounts.length} hesap${data.payments.length ? `, ${data.payments.length} kredi/fatura` : ''} ve ${data.transactions.length} işlem var.\nMevcut TÜM veriler silinip yedekle değiştirilecek.`,
     ok: 'Yükle', danger: true,
   });
   if (!ok) return;
   // Önce şifrele, sonra tek transaction'da temizle + yaz (atomik).
   const ops = db.DATA_STORES.map(store => ({ store, type: 'clear' }));
   for (const store of db.DATA_STORES) {
-    const recs = await Promise.all(data[store].map(o => cr.encryptRecord(S.dek, store, o)));
+    const recs = await Promise.all((data[store] || []).map(o => cr.encryptRecord(S.dek, store, o)));
     for (const r of recs) ops.push({ store, type: 'put', value: r });
   }
   await db.bulk(ops);
@@ -1065,7 +1605,7 @@ async function pinSubmit() {
           { store: 'meta', type: 'put', value: { key: 'pinLength', value: pin.length } },
         ]);
         S.meta.pinLength = pin.length;
-        S.data = { accounts: [], categories: [], transactions: [], recurring: [] };
+        S.data = { accounts: [], categories: [], transactions: [], recurring: [], payments: [] };
         await commit({ categories: defaultCategories() });
         setBusy(false);
         enterApp();
@@ -1136,6 +1676,7 @@ async function pinSubmit() {
 function enterApp() {
   hideLock();
   S.view = 'main';
+  S.mainPage = 0;
   S.accountId = null;
   render();
 }
@@ -1144,7 +1685,10 @@ function lockApp() {
   closeSheet();
   closeDialog();
   S.dek = null;
-  S.data = { accounts: [], categories: [], transactions: [], recurring: [] };
+  S.data = { accounts: [], categories: [], transactions: [], recurring: [], payments: [] };
+  S.mainPage = 0;
+  pagerRO?.disconnect();
+  pagerRO = null;
   $('#app').innerHTML = '';
   showLock('unlock');
 }
@@ -1226,6 +1770,20 @@ function bindEvents() {
         break;
       }
       case 'del-category': run(() => deleteCategory(id)); break;
+      case 'main-page': {
+        const pager = $('#pager');
+        if (pager) pager.scrollTo({ left: Number(el.dataset.p) * pager.clientWidth, behavior: 'smooth' });
+        break;
+      }
+      case 'new-loan': openPaymentSheet('loan'); break;
+      case 'new-bill': openPaymentSheet('bill'); break;
+      case 'edit-payment': {
+        const p = paymentById(id);
+        if (p) openPaymentSheet(p.kind, p);
+        break;
+      }
+      case 'delete-payment': run(() => deletePayment(id)); break;
+      case 'pay': openPaySheet(el.dataset.kind, id); break;
       case 'close-sheet': closeSheet(); break;
       case 'toggle-sign': {
         const form = el.closest('form');
@@ -1251,7 +1809,7 @@ function bindEvents() {
     const btn = form.querySelector('[type="submit"]');
     if (btn?.disabled) return;
     if (btn) btn.disabled = true;
-    const fn = { txn: submitTxn, transfer: submitTransfer, account: submitAccount, 'add-category': addCategory }[kind];
+    const fn = { txn: submitTxn, transfer: submitTransfer, account: submitAccount, 'add-category': addCategory, payment: submitPayment, pay: submitPay }[kind];
     Promise.resolve(fn?.(form))
       .catch(err => { console.error(err); setFormError('Kaydedilemedi: ' + (err.message || err)); })
       .finally(() => { if (btn) btn.disabled = false; });
@@ -1262,7 +1820,25 @@ function bindEvents() {
       const f = e.target.files[0];
       e.target.value = '';
       importBackup(f).catch(err => { console.error(err); toast('İçe aktarma hatası: ' + err.message); });
+      return;
     }
+    const form = e.target.form;
+    // Hesap formu: türe göre kart alanlarını göster/gizle
+    if (e.target.name === 'kind' && form?.dataset.form === 'account') {
+      form.classList.toggle('is-card', form.elements.kind.value === 'card');
+    }
+    // Kart ödemesi: Tamamı → borç hazır gelir, Asgari → boş
+    if (e.target.name === 'mode' && form?.dataset.form === 'pay') {
+      const min = form.elements.mode.value === 'min';
+      form.elements.amount.value = min ? '' : (form.dataset.full || '');
+      if (min) form.elements.amount.focus();
+    }
+  });
+
+  // Döndürme / boyut değişince ana ekran sayfasını hizada tut.
+  window.addEventListener('resize', () => {
+    const pager = $('#pager');
+    if (pager) pager.scrollLeft = S.mainPage * pager.clientWidth;
   });
 
   $('#sheet-backdrop').addEventListener('click', closeSheet);

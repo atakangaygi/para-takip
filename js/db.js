@@ -3,10 +3,11 @@
 // (tuz, sarılmış anahtar, PIN uzunluğu, deneme sayacı, son yedek zamanı) bulunur.
 
 const DB_NAME = 'para-takip';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 // "recurring" deposu ileride eklenecek tekrarlayan işlemler için şimdiden oluşturuluyor.
-export const DATA_STORES = ['accounts', 'categories', 'transactions', 'recurring'];
+// "payments" deposu ödemeler (düzenli/taksit) özelliği içindir (v2'de eklendi).
+export const DATA_STORES = ['accounts', 'categories', 'transactions', 'recurring', 'payments'];
 
 let dbPromise = null;
 
