@@ -10,6 +10,7 @@
   --green: #30d158;
   --red: #ff453a;
   --orange: #ff9f0a;
+  --yellow: #ffd60a;
   --radius: 16px;
   --sat: env(safe-area-inset-top, 0px);
   --sab: env(safe-area-inset-bottom, 0px);
@@ -557,3 +558,123 @@ body.privacy-on .privacy { display: flex; }
   font-size: 13px; color: var(--muted); font-weight: 600;
   padding: 14px 4px 0;
 }
+
+/* ---------- Ana ekran: yatay sayfalar ---------- */
+/* Kaydırıcı #app'in yan boşluklarına taşar; sayfalar boşluğu kendi içinde verir (kaydırırken kenarlar yapışmasın). */
+.pager {
+  display: flex; align-items: flex-start;
+  overflow-x: auto; overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  margin: 0 calc(-16px - var(--sar)) 20px calc(-16px - var(--sal));
+}
+.pager::-webkit-scrollbar { display: none; }
+.page {
+  flex: 0 0 100%; min-width: 0;
+  scroll-snap-align: start; scroll-snap-stop: always;
+  padding: 0 calc(16px + var(--sar)) 0 calc(16px + var(--sal));
+}
+.pager-dots {
+  position: fixed; left: 50%; bottom: calc(var(--sab) + 6px);
+  transform: translateX(-50%);
+  display: flex; gap: 0; padding: 0 4px;
+  border-radius: 999px;
+  background: rgba(22, 22, 29, .82);
+  -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+  z-index: 30;
+}
+.pdot { width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; }
+.pdot::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--surface-3); transition: background .2s;
+}
+.pdot.on::before { background: var(--text); }
+
+/* ---------- Ödeme durumu renkleri ---------- */
+.lv-warn { --lv: var(--yellow); }
+.lv-urgent { --lv: var(--orange); }
+.lv-overdue { --lv: var(--red); }
+.lv-paid, .lv-upcoming { --lv: var(--muted); }
+.due { color: var(--lv, var(--muted)); }
+
+/* Kart hesabında bakiyenin altındaki son ödeme satırı */
+.card-due {
+  font-size: 11.5px; margin-top: 1px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.card-due.lv-paid, .card-due.lv-upcoming { opacity: .75; }
+
+/* Ana ekran uyarı alanı */
+.alerts { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.alert {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 8px 8px 14px;
+  border-radius: 12px; border: 1px solid var(--border);
+  background: var(--surface);
+}
+.alert.lv-warn { background: rgba(255, 214, 10, .08); border-color: rgba(255, 214, 10, .3); }
+.alert.lv-urgent { background: rgba(255, 159, 10, .1); border-color: rgba(255, 159, 10, .38); }
+.alert.lv-overdue { background: rgba(255, 69, 58, .1); border-color: rgba(255, 69, 58, .42); }
+.alert-main { flex: 1; min-width: 0; }
+.alert-name { font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.alert-sub { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.alert-sub .due { font-weight: 600; }
+
+.btn-pay {
+  flex: none; min-height: 36px; padding: 0 14px;
+  border-radius: 999px;
+  font-size: 14px; font-weight: 600;
+  color: var(--accent); background: rgba(10, 132, 255, .14);
+  white-space: nowrap;
+}
+.btn-pay:active { filter: brightness(1.3); }
+.alert .btn-pay { color: var(--lv); background: rgba(255, 255, 255, .08); }
+.btn-pay.quiet { color: var(--muted); background: transparent; border: 1px solid var(--border); }
+
+/* Ödemeler sayfası */
+.page-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 16px 4px 14px;
+}
+.page-head h2 { margin: 0; font-size: 28px; font-weight: 700; letter-spacing: -0.01em; }
+.page-head .muted { font-size: 14px; }
+.pay-row {
+  display: flex; align-items: center; gap: 8px;
+  padding-right: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.pay-row:last-child { border-bottom: 0; }
+.pay-main {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 0 12px 14px; text-align: left;
+}
+.pay-main:active { opacity: .6; }
+/* Dar ekranda "… gün kaldı" kesilmesin: son ödeme satırı alt satıra insin. */
+.pay-row .row-sub.due { white-space: normal; overflow: visible; }
+.pay-row.faded .pay-main { opacity: .5; }
+.pay-row .row-title .tag { vertical-align: 1px; }
+.row-icon.pay-card { background: rgba(10, 132, 255, .14); color: var(--accent); }
+.row-icon.pay-loan { background: rgba(191, 90, 242, .14); color: #bf5af2; }
+.row-icon.pay-bill { background: rgba(255, 159, 10, .14); color: var(--orange); }
+.pay-adds { display: flex; gap: 10px; }
+.pay-adds .add-row { flex: 1; min-width: 0; }
+
+/* İki seçenekli seçim (hesap türü, Tamamı/Asgari) */
+.cat-pick.choice input:checked + label { color: var(--accent); background: rgba(10, 132, 255, .12); }
+
+/* Hesap formu: kart alanları yalnız "Kredi kartı" seçiliyken */
+.acc-form:not(.is-card) .card-fields { display: none; }
+.acc-form.is-card .plain-only { display: none; }
+
+/* Fatura geçmişi */
+.hist { background: var(--surface-2); border-radius: 12px; overflow: hidden; }
+.hist-row {
+  display: flex; justify-content: space-between; gap: 12px;
+  padding: 9px 14px; font-size: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.hist-row:last-child { border-bottom: 0; }
+.hist-row .num { color: var(--muted); }
